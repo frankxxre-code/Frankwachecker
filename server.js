@@ -1,6 +1,6 @@
 'use strict';
 /**
- * WA CHECKER PLATFORM v2
+ * WA CHECKER PLATFORM v3 — Fixed Pairing
  * Multi-user · Private sessions · Shared permanent DB
  * Admin panel · Job history · Live progress via WebSocket
  */
@@ -250,8 +250,7 @@ async function createQRSession(userId, sessionId, isReconnect = false) {
     const authDir = path.join(AUTH_DIR, String(userId), sessionId);
     if (sessionCleanup.get(key)) return;
 
-    // ✅ FIX: Only wipe auth on a brand-new session, not on reconnects.
-    // Wiping on reconnect would destroy saved credentials and prevent resuming.
+    // Only wipe auth on a brand-new session, not on reconnects
     if (!isReconnect) {
         try { await fs.rm(authDir, { recursive: true, force: true }); } catch (_) {}
     }
@@ -259,17 +258,29 @@ async function createQRSession(userId, sessionId, isReconnect = false) {
     await fs.mkdir(authDir, { recursive: true });
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-    if (!waSessions.has(key)) {
-        waSessions.set(key, { sessionId, userId, socket: null, saveCreds, state: 'connecting', pairingMethod: 'qr', phone: null, reconnectAttempts: 0 });
-    }
+    // Preserve reconnect metadata (reconnectAttempts etc) from existing entry
+    const existing = waSessions.get(key);
+    waSessions.set(key, {
+        sessionId, userId, saveCreds,
+        socket: null,
+        reconnecting: false,
+        state: 'initializing',
+        reconnectAttempts: existing?.reconnectAttempts || 0,
+        pairingMethod: 'qr',
+        phone: existing?.phone || null,
+    });
     const si = waSessions.get(key);
-    si.saveCreds = saveCreds;
 
+    // Use same socket options as working Telegram bot
     const sock = makeWASocket({
-        auth: state, printQRInTerminal: false,
-        browser: ['Ubuntu', 'Chrome', '120.0.0.0'], logger,
-        connectTimeoutMs: 45000, keepAliveIntervalMs: 8000,
-        retryRequestDelayMs: 300, defaultQueryTimeoutMs: 12000,
+        auth: state,
+        logger,
+        browser: [`WA Checker ${sessionId}`, 'Chrome', '131.0'],
+        syncFullHistory: false,
+        markOnlineOnConnect: false,
+        defaultQueryTimeoutMs: 15000,
+        keepAliveIntervalMs:   10000,
+        retryRequestDelayMs:   500,
     });
 
     si.socket = sock;
@@ -279,25 +290,26 @@ async function createQRSession(userId, sessionId, isReconnect = false) {
 
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', async (update) => {
-        if (sessionCleanup.get(key)) { try { sock.end(); } catch (_) {} return; }
+        if (sessionCleanup.get(key)) { try { sock.ev.removeAllListeners(); sock.end(); } catch (_) {} return; }
         const { connection, lastDisconnect, qr } = update;
         const s = waSessions.get(key);
         if (!s) return;
 
         if (qr) {
             try {
-                const dataUrl = await qrcode.toDataURL(qr, { margin: 2, width: 260 });
+                const dataUrl = await qrcode.toDataURL(qr, { errorCorrectionLevel: 'H', margin: 2, width: 400 });
                 sendToUser(userId, 'qr', { sessionId, qr: dataUrl });
                 s.state = 'awaiting_scan';
                 db.prepare('UPDATE wa_sessions SET state=? WHERE session_id=? AND user_id=?').run('awaiting_scan', sessionId, userId);
                 broadcastSessionsToUser(userId);
-            } catch (_) {}
+            } catch (err) { console.error(`[QR] ${sessionId}:`, err.message); }
         }
 
         if (connection === 'open') {
+            s.reconnecting = false;
+            s.reconnectAttempts = 0;
             s.state = 'connected';
             s.phone = sock.user?.id?.split(':')[0] || 'linked';
-            s.reconnectAttempts = 0;
             db.prepare('UPDATE wa_sessions SET state=?, phone=? WHERE session_id=? AND user_id=?').run('connected', s.phone, sessionId, userId);
             broadcastSessionsToUser(userId);
             sendToUser(userId, 'session_connected', { sessionId, phone: s.phone });
@@ -307,11 +319,13 @@ async function createQRSession(userId, sessionId, isReconnect = false) {
 
         if (connection === 'close') {
             const code   = lastDisconnect?.error?.output?.statusCode;
+            const errMsg = lastDisconnect?.error?.message || '';
             s.state = 'disconnected';
             db.prepare('UPDATE wa_sessions SET state=? WHERE session_id=? AND user_id=?').run('disconnected', sessionId, userId);
             broadcastSessionsToUser(userId);
 
-            const banned = code === DisconnectReason.loggedOut || code === 401 || code === 403;
+            const banned = code === DisconnectReason.loggedOut || code === 401 || code === 403 ||
+                (code === 500 && (errMsg.includes('ban') || errMsg.includes('illegal')));
             if (banned) {
                 sendToUser(userId, 'log', { level: 'error', msg: `${sessionId} logged out / banned — removed` });
                 await deleteWASession(userId, sessionId);
@@ -321,6 +335,7 @@ async function createQRSession(userId, sessionId, isReconnect = false) {
             if (s.reconnectAttempts <= 6) {
                 const delay = [2000,4000,8000,15000,25000,30000][s.reconnectAttempts-1] || 30000;
                 s.state = 'reconnecting';
+                s.reconnecting = true;
                 db.prepare('UPDATE wa_sessions SET state=? WHERE session_id=? AND user_id=?').run('reconnecting', sessionId, userId);
                 broadcastSessionsToUser(userId);
                 sendToUser(userId, 'log', { level: 'warn', msg: `${sessionId} reconnecting in ${delay/1000}s (${s.reconnectAttempts}/6)` });
@@ -337,127 +352,130 @@ async function createQRSession(userId, sessionId, isReconnect = false) {
 
 // ─── WA SESSION: PHONE PAIRING ────────────────────────────────────
 async function createPhoneSession(userId, sessionId, phoneNumber) {
-    return new Promise(async (resolve) => {
-        const key     = `${userId}:${sessionId}`;
-        const authDir = path.join(AUTH_DIR, String(userId), sessionId);
+    return new Promise((resolve) => {
+        const key = `${userId}:${sessionId}`;
         if (sessionCleanup.get(key)) { resolve('ABORT'); return; }
 
-        // NOTE: Auth dir is wiped by runPhonePairingWithRetry (shouldResetAuth),
-        // not here — matches the working Telegram bot exactly.
-        await fs.mkdir(authDir, { recursive: true });
+        (async () => {
+            try {
+                const authDir = path.join(AUTH_DIR, String(userId), sessionId);
+                await fs.mkdir(authDir, { recursive: true });
 
-        const { state, saveCreds } = await useMultiFileAuthState(authDir);
+                const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-        if (!waSessions.has(key)) {
-            waSessions.set(key, { sessionId, userId, socket: null, saveCreds, state: 'connecting', pairingMethod: 'phone', pairingPhone: phoneNumber, phone: null, reconnectAttempts: 0 });
-        }
-        const si = waSessions.get(key);
-        si.saveCreds    = saveCreds;
-        si.pairingPhone = phoneNumber;
+                const sock = makeWASocket({
+                    auth: state,
+                    printQRInTerminal: false,
+                    browser: ['Ubuntu', 'Chrome', '120.0.0.0'],
+                    logger,
+                    connectTimeoutMs:      45000,
+                    keepAliveIntervalMs:   8000,
+                    retryRequestDelayMs:   300,
+                    defaultQueryTimeoutMs: 12000,
+                });
 
-        try {
-            const sock = makeWASocket({
-                auth: state,
-                printQRInTerminal: false,
-                browser: ['Ubuntu', 'Chrome', '120.0.0.0'],
-                logger,
-                connectTimeoutMs:       45000,
-                keepAliveIntervalMs:    8000,
-                retryRequestDelayMs:    300,
-                defaultQueryTimeoutMs:  12000,
-            });
+                // Always fetch fresh si from map (set by runPhonePairingWithRetry before calling us)
+                const si = waSessions.get(key);
+                if (!si) { sock.end(); resolve('ABORT'); return; }
 
-            si.socket = sock;
-            si.state  = 'connecting';
-            broadcastSessionsToUser(userId);
+                si.socket    = sock;
+                si.saveCreds = saveCreds;
+                si.state     = 'connecting';
+                broadcastSessionsToUser(userId);
 
-            sock.ev.on('creds.update', saveCreds);
-            let codeRequested = false;
-            let resolved = false;
-            const done = v => { if (!resolved) { resolved = true; resolve(v); } };
+                let codeRequested = false;
+                let resolved      = false;
+                const done = (val) => { if (resolved) return; resolved = true; resolve(val); };
 
-            sock.ev.on('connection.update', async (update) => {
-                if (sessionCleanup.get(key)) { try { sock.end(); } catch(_){} done('ABORT'); return; }
-                const { connection, lastDisconnect } = update;
-                const s = waSessions.get(key);
-                if (!s) { done('ABORT'); return; }
+                sock.ev.on('creds.update', saveCreds);
 
-                if (connection === 'open') {
-                    s.state = 'connected';
-                    s.phone = sock.user?.id?.split(':')[0] || phoneNumber;
-                    s.reconnectAttempts = 0;
-                    db.prepare('UPDATE wa_sessions SET state=?, phone=? WHERE session_id=? AND user_id=?').run('connected', s.phone, sessionId, userId);
-                    broadcastSessionsToUser(userId);
-                    sendToUser(userId, 'session_connected', { sessionId, phone: s.phone });
-                    sendToUser(userId, 'log', { level: 'success', msg: `${sessionId} connected — ${s.phone}` });
-                    done(true);
-                }
+                sock.ev.on('connection.update', async (update) => {
+                    if (sessionCleanup.get(key)) { sock.end(); done('ABORT'); return; }
 
-                if (connection === 'close') {
-                    const code = lastDisconnect?.error?.output?.statusCode;
-                    try { sock.end(); } catch(_) {}
-                    if (code === 401) {
-                        setTimeout(() => done('RESET'), 2000);
+                    const { connection, lastDisconnect } = update;
+                    const s = waSessions.get(key);
+                    if (!s) { sock.end(); done('ABORT'); return; }
+
+                    if (connection === 'open') {
+                        s.state = 'connected';
+                        s.phone = sock.user?.id?.split(':')[0] || phoneNumber;
+                        s.reconnectAttempts = 0;
+                        db.prepare('UPDATE wa_sessions SET state=?, phone=? WHERE session_id=? AND user_id=?').run('connected', s.phone, sessionId, userId);
+                        broadcastSessionsToUser(userId);
+                        sendToUser(userId, 'session_connected', { sessionId, phone: s.phone });
+                        sendToUser(userId, 'log', { level: 'success', msg: `${sessionId} connected — ${s.phone}` });
+                        sendToAdmins('admin_event', { event: 'session_connected', userId, sessionId, phone: s.phone });
+                        done(true);
                         return;
                     }
-                    if (code === 515 || code === 503) {
-                        setTimeout(() => done(sessionCleanup.get(key) ? 'ABORT' : 'RETRY'), 5000);
-                        return;
-                    }
-                    setTimeout(() => done(sessionCleanup.get(key) ? 'ABORT' : 'RETRY'), 4000);
-                }
 
-                // ✅ Matches working Telegram bot exactly:
-                // requestPairingCode is called inside connection.update at 'connecting'
-                // with a 1500ms stabilisation sleep — same as the working bot.
-                if (!codeRequested && connection === 'connecting' && !sock.authState.creds.registered) {
-                    codeRequested = true;
-                    await sleep(1500);
-                    try {
-                        const code = await sock.requestPairingCode(phoneNumber);
-                        if (code && !sessionCleanup.get(key)) {
-                            const fmt = code.match(/.{1,4}/g)?.join('-') || code;
-                            s.state = 'awaiting_scan';
-                            db.prepare('UPDATE wa_sessions SET state=? WHERE session_id=? AND user_id=?').run('awaiting_scan', sessionId, userId);
-                            broadcastSessionsToUser(userId);
-                            sendToUser(userId, 'pairing_code', { sessionId, code: fmt, phone: phoneNumber });
-                            sendToUser(userId, 'log', { level: 'info', msg: `Pairing code for ${sessionId}: ${fmt}` });
+                    if (connection === 'close') {
+                        const code = lastDisconnect?.error?.output?.statusCode;
+                        sock.end();
+                        if (code === 401) {
+                            setTimeout(() => done('RESET'), 2000);
+                            return;
                         }
-                    } catch (e) {
-                        sendToUser(userId, 'log', { level: 'error', msg: `Failed to get pairing code: ${e.message}` });
-                        try { sock.end(); } catch(_) {}
-                        done('RETRY');
+                        if (code === 515 || code === 503) {
+                            setTimeout(() => done(sessionCleanup.get(key) ? 'ABORT' : 'RETRY'), 5000);
+                            return;
+                        }
+                        setTimeout(() => done(sessionCleanup.get(key) ? 'ABORT' : 'RETRY'), 4000);
                     }
-                }
-            });
 
-        } catch (err) {
-            console.error('[createPhoneSession]', err.message);
-            resolve('RESET');
-        }
+                    if (!codeRequested && connection === 'connecting' && !sock.authState.creds.registered) {
+                        codeRequested = true;
+                        await sleep(1500);
+                        try {
+                            const code = await sock.requestPairingCode(phoneNumber);
+                            if (code && !sessionCleanup.get(key)) {
+                                const fmt = code.match(/.{1,4}/g)?.join('-') || code;
+                                s.state = 'awaiting_scan';
+                                db.prepare('UPDATE wa_sessions SET state=? WHERE session_id=? AND user_id=?').run('awaiting_scan', sessionId, userId);
+                                broadcastSessionsToUser(userId);
+                                sendToUser(userId, 'pairing_code', { sessionId, code: fmt, phone: phoneNumber });
+                                sendToUser(userId, 'log', { level: 'info', msg: `Pairing code for ${sessionId}: ${fmt}` });
+                            }
+                        } catch (err) {
+                            console.error('[requestPairingCode]', err.message);
+                            sock.end();
+                            done('RETRY');
+                        }
+                    }
+                });
+
+            } catch (err) {
+                console.error('[createPhoneSession]', err.message);
+                resolve('RESET');
+            }
+        })();
     });
 }
 
 async function runPhonePairingWithRetry(userId, sessionId, phoneNumber) {
-    // ✅ Matches working Telegram bot exactly:
-    // Only wipe auth when shouldResetAuth=true (on RESET/first attempt),
-    // NOT on every attempt — allows the socket to reconnect without losing state.
     let shouldResetAuth = true;
-    let attempts = 0;
 
-    while (attempts < 10) {
-        const key = `${userId}:${sessionId}`;
-        if (sessionCleanup.get(key)) break;
+    // Pre-set session in map before the loop — exactly like working bot pre-sets sessions.set()
+    // This ensures waSessions.get(key) always succeeds inside createPhoneSession
+    const key = `${userId}:${sessionId}`;
+    if (!waSessions.has(key)) {
+        waSessions.set(key, {
+            sessionId, userId, socket: null, saveCreds: null,
+            state: 'initializing', reconnectAttempts: 0,
+            pairingMethod: 'phone', pairingPhone: phoneNumber, phone: null,
+        });
+    }
 
+    while (!sessionCleanup.get(key)) {
         if (shouldResetAuth) {
             const authDir = path.join(AUTH_DIR, String(userId), sessionId);
             try { require('fs').rmSync(authDir, { recursive: true, force: true }); } catch (_) {}
             shouldResetAuth = false;
         }
 
-        attempts++;
-        sendToUser(userId, 'log', { level: 'info', msg: `Pairing attempt ${attempts} for ${sessionId} (${phoneNumber})` });
+        sendToUser(userId, 'log', { level: 'info', msg: `Pairing attempt for ${sessionId} (${phoneNumber})` });
         const result = await createPhoneSession(userId, sessionId, phoneNumber);
+
         if (result === true)    { break; }
         if (result === 'ABORT') { break; }
         if (result === 'RESET') { shouldResetAuth = true; await sleep(2000); continue; }
