@@ -630,8 +630,8 @@ const app    = express();
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server });
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(session({ secret: SESSION_SECRET, resave: false, saveUninitialized: false, cookie: { maxAge: 7 * 24 * 3600 * 1000 } }));
 // Auto-detect whether HTML files are in /public subfolder or root
 const PUBLIC_DIR = (() => {
@@ -870,6 +870,17 @@ wss.on('connection', (ws, req) => {
                     sendToUser(userId, 'log', { level: 'warn', msg: 'Sessions offline — job paused' });
                     break;
 
+                case 'job_waiting':
+                    sendToUser(userId, 'job_waiting', { jobId: msg.jobId });
+                    sendToUser(userId, 'log', { level: 'warn', msg: '⏳ Sessions reconnecting — job waiting (up to 90s)...' });
+                    break;
+
+                case 'job_resumed_auto':
+                    db.prepare('UPDATE jobs SET status=? WHERE job_id=?').run('running', msg.jobId);
+                    sendToUser(userId, 'job_resumed_auto', { jobId: msg.jobId });
+                    sendToUser(userId, 'log', { level: 'success', msg: '✅ Session reconnected — job resuming automatically' });
+                    break;
+
                 case 'job_resumed':
                     db.prepare('UPDATE jobs SET status=? WHERE job_id=?').run('running', msg.jobId);
                     sendToUser(userId, 'job_start', { jobId: msg.jobId, total: msg.total, mode: 'RESUME' });
@@ -1045,7 +1056,10 @@ app.post('/api/user/upload', requireAuth, upload.single('file'), async (req, res
         fromCache:  known.length,
         knownReg:   knownReg.length,
         knownNotReg:knownNotReg.length,
-        jobData: { allNumbers: numbers, unknown, knownReg, knownNotReg, freshReg: [], freshNotReg: [], filename: req.file.originalname }
+        jobData: { allNumbers: numbers, unknown, knownReg, knownNotReg, freshReg: [], freshNotReg: [], filename: req.file.originalname },
+        // Also send the actual arrays so dashboard can trigger immediate downloads
+        cachedRegData:    knownReg,
+        cachedNotRegData: knownNotReg,
     });
 });
 
