@@ -5,6 +5,11 @@
  * Admin panel · Job history · Live progress via WebSocket
  */
 
+// Polyfill Web Crypto API for Node.js < 19 — required by Baileys requestPairingCode
+if (!globalThis.crypto) {
+    globalThis.crypto = require('crypto').webcrypto;
+}
+
 const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino      = require('pino');
 const express   = require('express');
@@ -331,7 +336,10 @@ async function createPhoneSession(userId, sessionId, phoneNumber) {
         const authDir = path.join(AUTH_DIR, String(userId), sessionId);
         if (sessionCleanup.get(key)) { resolve('ABORT'); return; }
 
+        // Always wipe auth dir before attempting — matches original bot exactly
+        try { await fs.rm(authDir, { recursive: true, force: true }); } catch (_) {}
         await fs.mkdir(authDir, { recursive: true });
+
         const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
         if (!waSessions.has(key)) {
@@ -342,10 +350,14 @@ async function createPhoneSession(userId, sessionId, phoneNumber) {
         si.pairingPhone = phoneNumber;
 
         const sock = makeWASocket({
-            auth: state, printQRInTerminal: false,
-            browser: ['Ubuntu', 'Chrome', '120.0.0.0'], logger,
-            connectTimeoutMs: 45000, keepAliveIntervalMs: 8000,
-            retryRequestDelayMs: 300, defaultQueryTimeoutMs: 12000,
+            auth: state,
+            printQRInTerminal: false,
+            browser: ['Ubuntu', 'Chrome', '120.0.0.0'],
+            logger,
+            connectTimeoutMs:       45000,
+            keepAliveIntervalMs:    8000,
+            retryRequestDelayMs:    300,
+            defaultQueryTimeoutMs:  12000,
         });
 
         si.socket = sock;
@@ -362,9 +374,10 @@ async function createPhoneSession(userId, sessionId, phoneNumber) {
             const s = waSessions.get(key);
             if (!s) { done('ABORT'); return; }
 
+            // Request pairing code as soon as we are connecting and not yet registered
             if (!codeRequested && connection === 'connecting' && !sock.authState.creds.registered) {
                 codeRequested = true;
-                await sleep(1500);
+                await sleep(1500); // wait for connection to stabilize
                 try {
                     const code = await sock.requestPairingCode(phoneNumber);
                     if (code && !sessionCleanup.get(key)) {
@@ -377,6 +390,7 @@ async function createPhoneSession(userId, sessionId, phoneNumber) {
                     }
                 } catch (e) {
                     sendToUser(userId, 'log', { level: 'error', msg: `Failed to get pairing code: ${e.message}` });
+                    try { sock.end(); } catch(_) {}
                     done('RETRY');
                 }
             }
@@ -395,7 +409,15 @@ async function createPhoneSession(userId, sessionId, phoneNumber) {
             if (connection === 'close') {
                 const code = lastDisconnect?.error?.output?.statusCode;
                 try { sock.end(); } catch(_) {}
-                if (code === 401) { setTimeout(() => done('RESET'), 2000); return; }
+                if (code === 401) {
+                    // Code expired — reset and get a new one
+                    setTimeout(() => done('RESET'), 2000);
+                    return;
+                }
+                if (code === 515 || code === 503) {
+                    setTimeout(() => done(sessionCleanup.get(key) ? 'ABORT' : 'RETRY'), 5000);
+                    return;
+                }
                 setTimeout(() => done(sessionCleanup.get(key) ? 'ABORT' : 'RETRY'), 4000);
             }
         });
@@ -403,14 +425,18 @@ async function createPhoneSession(userId, sessionId, phoneNumber) {
 }
 
 async function runPhonePairingWithRetry(userId, sessionId, phoneNumber) {
-    for (let i = 0; i < 5; i++) {
+    let attempts = 0;
+    while (attempts < 10) {
         const key = `${userId}:${sessionId}`;
         if (sessionCleanup.get(key)) break;
+        attempts++;
+        sendToUser(userId, 'log', { level: 'info', msg: `Pairing attempt ${attempts} for ${sessionId} (${phoneNumber})` });
         const result = await createPhoneSession(userId, sessionId, phoneNumber);
-        if (result === true || result === 'ABORT') break;
-        const authDir = path.join(AUTH_DIR, String(userId), sessionId);
-        try { await fs.rm(authDir, { recursive: true, force: true }); } catch (_) {}
-        await sleep(2000);
+        if (result === true)    { break; }
+        if (result === 'ABORT') { break; }
+        if (result === 'RESET') { await sleep(2000); continue; }  // auth already wiped in createPhoneSession
+        if (result === 'RETRY') { await sleep(3000); continue; }
+        break;
     }
 }
 
