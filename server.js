@@ -1,6 +1,6 @@
 'use strict';
 /**
- * WA CHECKER PLATFORM v3 — Fixed Pairing
+ * WA CHECKER PLATFORM v2
  * Multi-user · Private sessions · Shared permanent DB
  * Admin panel · Job history · Live progress via WebSocket
  */
@@ -36,25 +36,6 @@ const RESULTS_DB_FILE = path.join(BASE_DIR, 'results_db.json');
 const PENDING_DIR   = path.join(BASE_DIR, 'pending');
 const AUTH_DIR      = path.join(BASE_DIR, 'sessions');
 const DB_PATH       = path.join(BASE_DIR, 'platform.db');
-
-// ─── PROXY CONFIG ─────────────────────────────────────────────────
-// Error 405 = WhatsApp blocks Railway/datacenter IPs.
-// Fix: set PROXY_URL env var to a residential SOCKS5 proxy.
-// Format: socks5://user:pass@host:port
-const PROXY_URL = process.env.PROXY_URL || null;
-let proxyAgent = null;
-if (PROXY_URL) {
-    try {
-        const { SocksProxyAgent } = require('socks-proxy-agent');
-        proxyAgent = new SocksProxyAgent(PROXY_URL);
-        console.log('🔀 Proxy enabled: ' + PROXY_URL.replace(/:([^:@]+)@/, ':****@'));
-    } catch (e) {
-        console.warn('⚠️  socks-proxy-agent not installed — run: npm install socks-proxy-agent');
-    }
-} else {
-    console.warn('⚠️  PROXY_URL not set. Error 405 = WhatsApp blocking this server IP. Set PROXY_URL in Railway env vars.');
-}
-
 
 // ─── TUNING ──────────────────────────────────────────────────────
 const CONCURRENCY_PER_SESSION = 50;
@@ -264,43 +245,25 @@ function broadcastSessionsToUser(userId) {
 }
 
 // ─── WA SESSION: CREATE QR ────────────────────────────────────────
-async function createQRSession(userId, sessionId, isReconnect = false) {
+async function createQRSession(userId, sessionId) {
     const key     = `${userId}:${sessionId}`;
     const authDir = path.join(AUTH_DIR, String(userId), sessionId);
     if (sessionCleanup.get(key)) return;
 
-    // Only wipe auth on a brand-new session, not on reconnects
-    if (!isReconnect) {
-        try { await fs.rm(authDir, { recursive: true, force: true }); } catch (_) {}
-    }
-
     await fs.mkdir(authDir, { recursive: true });
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-    // Preserve reconnect metadata (reconnectAttempts etc) from existing entry
-    const existing = waSessions.get(key);
-    waSessions.set(key, {
-        sessionId, userId, saveCreds,
-        socket: null,
-        reconnecting: false,
-        state: 'initializing',
-        reconnectAttempts: existing?.reconnectAttempts || 0,
-        pairingMethod: 'qr',
-        phone: existing?.phone || null,
-    });
+    if (!waSessions.has(key)) {
+        waSessions.set(key, { sessionId, userId, socket: null, saveCreds, state: 'connecting', pairingMethod: 'qr', phone: null, reconnectAttempts: 0 });
+    }
     const si = waSessions.get(key);
+    si.saveCreds = saveCreds;
 
-    // Use same socket options as working Telegram bot
     const sock = makeWASocket({
-        auth: state,
-        logger,
-        browser: [`WA Checker ${sessionId}`, 'Chrome', '131.0'],
-        syncFullHistory: false,
-        markOnlineOnConnect: false,
-        defaultQueryTimeoutMs: 15000,
-        keepAliveIntervalMs:   10000,
-        retryRequestDelayMs:   500,
-        ...(proxyAgent ? { agent: proxyAgent } : {}),
+        auth: state, printQRInTerminal: false,
+        browser: ['Ubuntu', 'Chrome', '120.0.0.0'], logger,
+        connectTimeoutMs: 45000, keepAliveIntervalMs: 8000,
+        retryRequestDelayMs: 300, defaultQueryTimeoutMs: 12000,
     });
 
     si.socket = sock;
@@ -310,26 +273,25 @@ async function createQRSession(userId, sessionId, isReconnect = false) {
 
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', async (update) => {
-        if (sessionCleanup.get(key)) { try { sock.ev.removeAllListeners(); sock.end(); } catch (_) {} return; }
+        if (sessionCleanup.get(key)) { try { sock.end(); } catch (_) {} return; }
         const { connection, lastDisconnect, qr } = update;
         const s = waSessions.get(key);
         if (!s) return;
 
         if (qr) {
             try {
-                const dataUrl = await qrcode.toDataURL(qr, { errorCorrectionLevel: 'H', margin: 2, width: 400 });
+                const dataUrl = await qrcode.toDataURL(qr, { margin: 2, width: 260 });
                 sendToUser(userId, 'qr', { sessionId, qr: dataUrl });
                 s.state = 'awaiting_scan';
                 db.prepare('UPDATE wa_sessions SET state=? WHERE session_id=? AND user_id=?').run('awaiting_scan', sessionId, userId);
                 broadcastSessionsToUser(userId);
-            } catch (err) { console.error(`[QR] ${sessionId}:`, err.message); }
+            } catch (_) {}
         }
 
         if (connection === 'open') {
-            s.reconnecting = false;
-            s.reconnectAttempts = 0;
             s.state = 'connected';
             s.phone = sock.user?.id?.split(':')[0] || 'linked';
+            s.reconnectAttempts = 0;
             db.prepare('UPDATE wa_sessions SET state=?, phone=? WHERE session_id=? AND user_id=?').run('connected', s.phone, sessionId, userId);
             broadcastSessionsToUser(userId);
             sendToUser(userId, 'session_connected', { sessionId, phone: s.phone });
@@ -339,13 +301,11 @@ async function createQRSession(userId, sessionId, isReconnect = false) {
 
         if (connection === 'close') {
             const code   = lastDisconnect?.error?.output?.statusCode;
-            const errMsg = lastDisconnect?.error?.message || '';
             s.state = 'disconnected';
             db.prepare('UPDATE wa_sessions SET state=? WHERE session_id=? AND user_id=?').run('disconnected', sessionId, userId);
             broadcastSessionsToUser(userId);
 
-            const banned = code === DisconnectReason.loggedOut || code === 401 || code === 403 ||
-                (code === 500 && (errMsg.includes('ban') || errMsg.includes('illegal')));
+            const banned = code === DisconnectReason.loggedOut || code === 401 || code === 403;
             if (banned) {
                 sendToUser(userId, 'log', { level: 'error', msg: `${sessionId} logged out / banned — removed` });
                 await deleteWASession(userId, sessionId);
@@ -355,12 +315,11 @@ async function createQRSession(userId, sessionId, isReconnect = false) {
             if (s.reconnectAttempts <= 6) {
                 const delay = [2000,4000,8000,15000,25000,30000][s.reconnectAttempts-1] || 30000;
                 s.state = 'reconnecting';
-                s.reconnecting = true;
                 db.prepare('UPDATE wa_sessions SET state=? WHERE session_id=? AND user_id=?').run('reconnecting', sessionId, userId);
                 broadcastSessionsToUser(userId);
                 sendToUser(userId, 'log', { level: 'warn', msg: `${sessionId} reconnecting in ${delay/1000}s (${s.reconnectAttempts}/6)` });
                 setTimeout(() => {
-                    if (!sessionCleanup.get(key)) { waSessions.delete(key); createQRSession(userId, sessionId, true); }
+                    if (!sessionCleanup.get(key)) { waSessions.delete(key); createQRSession(userId, sessionId); }
                 }, delay);
             } else {
                 sendToUser(userId, 'log', { level: 'error', msg: `${sessionId} failed after 6 retries — removed` });
@@ -372,149 +331,110 @@ async function createQRSession(userId, sessionId, isReconnect = false) {
 
 // ─── WA SESSION: PHONE PAIRING ────────────────────────────────────
 async function createPhoneSession(userId, sessionId, phoneNumber) {
-    return new Promise((resolve) => {
-        const key = `${userId}:${sessionId}`;
+    return new Promise(async (resolve) => {
+        const key     = `${userId}:${sessionId}`;
+        const authDir = path.join(AUTH_DIR, String(userId), sessionId);
         if (sessionCleanup.get(key)) { resolve('ABORT'); return; }
 
-        (async () => {
-            try {
-                const authDir = path.join(AUTH_DIR, String(userId), sessionId);
-                await fs.mkdir(authDir, { recursive: true });
+        // Always wipe auth dir before attempting — matches original bot exactly
+        try { await fs.rm(authDir, { recursive: true, force: true }); } catch (_) {}
+        await fs.mkdir(authDir, { recursive: true });
 
-                const { state, saveCreds } = await useMultiFileAuthState(authDir);
+        const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-                const sock = makeWASocket({
-                    auth: state,
-                    printQRInTerminal: false,
-                    browser: ['Ubuntu', 'Chrome', '120.0.0.0'],
-                    logger,
-                    connectTimeoutMs:      45000,
-                    keepAliveIntervalMs:   8000,
-                    retryRequestDelayMs:   300,
-                    defaultQueryTimeoutMs: 12000,
-                    ...(proxyAgent ? { agent: proxyAgent } : {}),
-                });
+        if (!waSessions.has(key)) {
+            waSessions.set(key, { sessionId, userId, socket: null, saveCreds, state: 'connecting', pairingMethod: 'phone', pairingPhone: phoneNumber, phone: null, reconnectAttempts: 0 });
+        }
+        const si = waSessions.get(key);
+        si.saveCreds    = saveCreds;
+        si.pairingPhone = phoneNumber;
 
-                // Always fetch fresh si from map (set by runPhonePairingWithRetry before calling us)
-                const si = waSessions.get(key);
-                if (!si) { sock.end(); resolve('ABORT'); return; }
+        const sock = makeWASocket({
+            auth: state,
+            printQRInTerminal: false,
+            browser: ['Ubuntu', 'Chrome', '120.0.0.0'],
+            logger,
+            connectTimeoutMs:       45000,
+            keepAliveIntervalMs:    8000,
+            retryRequestDelayMs:    300,
+            defaultQueryTimeoutMs:  12000,
+        });
 
-                si.socket    = sock;
-                si.saveCreds = saveCreds;
-                si.state     = 'connecting';
-                broadcastSessionsToUser(userId);
+        si.socket = sock;
+        si.state  = 'connecting';
+        broadcastSessionsToUser(userId);
 
-                let codeRequested = false;
-                let codeSent      = false;   // true once a real code was displayed
-                let resolved      = false;
-                const done = (val) => { if (resolved) return; resolved = true; resolve(val); };
+        sock.ev.on('creds.update', saveCreds);
+        let codeRequested = false, resolved = false;
+        const done = v => { if (!resolved) { resolved = true; resolve(v); } };
 
-                sock.ev.on('creds.update', saveCreds);
+        sock.ev.on('connection.update', async (update) => {
+            if (sessionCleanup.get(key)) { try { sock.end(); } catch(_){} done('ABORT'); return; }
+            const { connection, lastDisconnect } = update;
+            const s = waSessions.get(key);
+            if (!s) { done('ABORT'); return; }
 
-                sock.ev.on('connection.update', async (update) => {
-                    if (sessionCleanup.get(key)) { sock.end(); done('ABORT'); return; }
-
-                    const { connection, lastDisconnect } = update;
-                    const s = waSessions.get(key);
-                    if (!s) { sock.end(); done('ABORT'); return; }
-
-                    if (connection === 'open') {
-                        s.state = 'connected';
-                        s.phone = sock.user?.id?.split(':')[0] || phoneNumber;
-                        s.reconnectAttempts = 0;
-                        db.prepare('UPDATE wa_sessions SET state=?, phone=? WHERE session_id=? AND user_id=?').run('connected', s.phone, sessionId, userId);
+            // Request pairing code as soon as we are connecting and not yet registered
+            if (!codeRequested && connection === 'connecting' && !sock.authState.creds.registered) {
+                codeRequested = true;
+                await sleep(1500); // wait for connection to stabilize
+                try {
+                    const code = await sock.requestPairingCode(phoneNumber);
+                    if (code && !sessionCleanup.get(key)) {
+                        const fmt = code.match(/.{1,4}/g)?.join('-') || code;
+                        s.state = 'awaiting_scan';
+                        db.prepare('UPDATE wa_sessions SET state=? WHERE session_id=? AND user_id=?').run('awaiting_scan', sessionId, userId);
                         broadcastSessionsToUser(userId);
-                        sendToUser(userId, 'session_connected', { sessionId, phone: s.phone });
-                        sendToUser(userId, 'log', { level: 'success', msg: `${sessionId} connected — ${s.phone}` });
-                        sendToAdmins('admin_event', { event: 'session_connected', userId, sessionId, phone: s.phone });
-                        done(true);
-                        return;
+                        sendToUser(userId, 'pairing_code', { sessionId, code: fmt, phone: phoneNumber });
+                        sendToUser(userId, 'log', { level: 'info', msg: `Pairing code for ${sessionId}: ${fmt}` });
                     }
-
-                    if (connection === 'close') {
-                        const code = lastDisconnect?.error?.output?.statusCode;
-                        const errMsg = lastDisconnect?.error?.message || '';
-                        console.log(`[PhonePairing] ${sessionId} close — code=${code} codeSent=${codeSent} msg=${errMsg}`);
-                        sock.end();
-
-                        // Code expired — always reset auth and get a fresh code
-                        if (code === 401) {
-                            setTimeout(() => done('RESET'), 2000);
-                            return;
-                        }
-                        if (code === 515 || code === 503) {
-                            setTimeout(() => done(sessionCleanup.get(key) ? 'ABORT' : 'RETRY'), 5000);
-                            return;
-                        }
-                        // If we already showed a pairing code and socket closed unexpectedly,
-                        // do a full RESET (wipe auth) — NOT a simple RETRY which reuses bad state.
-                        // Simple RETRY with dirty auth is what was generating the fake codes.
-                        if (codeSent) {
-                            setTimeout(() => done(sessionCleanup.get(key) ? 'ABORT' : 'RESET'), 2000);
-                            return;
-                        }
-                        setTimeout(() => done(sessionCleanup.get(key) ? 'ABORT' : 'RETRY'), 4000);
-                    }
-
-                    if (!codeRequested && connection === 'connecting' && !sock.authState.creds.registered) {
-                        codeRequested = true;
-                        await sleep(1500);
-                        try {
-                            const code = await sock.requestPairingCode(phoneNumber);
-                            if (code && !sessionCleanup.get(key)) {
-                                const fmt = code.match(/.{1,4}/g)?.join('-') || code;
-                                codeSent = true;
-                                s.state = 'awaiting_scan';
-                                db.prepare('UPDATE wa_sessions SET state=? WHERE session_id=? AND user_id=?').run('awaiting_scan', sessionId, userId);
-                                broadcastSessionsToUser(userId);
-                                sendToUser(userId, 'pairing_code', { sessionId, code: fmt, phone: phoneNumber });
-                                sendToUser(userId, 'log', { level: 'info', msg: `Pairing code for ${sessionId}: ${fmt}` });
-                            }
-                        } catch (err) {
-                            console.error('[requestPairingCode]', err.message);
-                            sock.end();
-                            // Don't retry with dirty auth — reset fully
-                            done('RESET');
-                        }
-                    }
-                });
-
-            } catch (err) {
-                console.error('[createPhoneSession]', err.message);
-                resolve('RESET');
+                } catch (e) {
+                    sendToUser(userId, 'log', { level: 'error', msg: `Failed to get pairing code: ${e.message}` });
+                    try { sock.end(); } catch(_) {}
+                    done('RETRY');
+                }
             }
-        })();
+
+            if (connection === 'open') {
+                s.state = 'connected';
+                s.phone = sock.user?.id?.split(':')[0] || phoneNumber;
+                s.reconnectAttempts = 0;
+                db.prepare('UPDATE wa_sessions SET state=?, phone=? WHERE session_id=? AND user_id=?').run('connected', s.phone, sessionId, userId);
+                broadcastSessionsToUser(userId);
+                sendToUser(userId, 'session_connected', { sessionId, phone: s.phone });
+                sendToUser(userId, 'log', { level: 'success', msg: `${sessionId} connected — ${s.phone}` });
+                done(true);
+            }
+
+            if (connection === 'close') {
+                const code = lastDisconnect?.error?.output?.statusCode;
+                try { sock.end(); } catch(_) {}
+                if (code === 401) {
+                    // Code expired — reset and get a new one
+                    setTimeout(() => done('RESET'), 2000);
+                    return;
+                }
+                if (code === 515 || code === 503) {
+                    setTimeout(() => done(sessionCleanup.get(key) ? 'ABORT' : 'RETRY'), 5000);
+                    return;
+                }
+                setTimeout(() => done(sessionCleanup.get(key) ? 'ABORT' : 'RETRY'), 4000);
+            }
+        });
     });
 }
 
 async function runPhonePairingWithRetry(userId, sessionId, phoneNumber) {
-    let shouldResetAuth = true;
-
-    // Pre-set session in map before the loop — exactly like working bot pre-sets sessions.set()
-    // This ensures waSessions.get(key) always succeeds inside createPhoneSession
-    const key = `${userId}:${sessionId}`;
-    if (!waSessions.has(key)) {
-        waSessions.set(key, {
-            sessionId, userId, socket: null, saveCreds: null,
-            state: 'initializing', reconnectAttempts: 0,
-            pairingMethod: 'phone', pairingPhone: phoneNumber, phone: null,
-        });
-    }
-
-    while (!sessionCleanup.get(key)) {
-        if (shouldResetAuth) {
-            const authDir = path.join(AUTH_DIR, String(userId), sessionId);
-            try { require('fs').rmSync(authDir, { recursive: true, force: true }); } catch (_) {}
-            shouldResetAuth = false;
-        }
-
-        sendToUser(userId, 'log', { level: 'info', msg: `Pairing attempt for ${sessionId} (${phoneNumber})` });
+    let attempts = 0;
+    while (attempts < 10) {
+        const key = `${userId}:${sessionId}`;
+        if (sessionCleanup.get(key)) break;
+        attempts++;
+        sendToUser(userId, 'log', { level: 'info', msg: `Pairing attempt ${attempts} for ${sessionId} (${phoneNumber})` });
         const result = await createPhoneSession(userId, sessionId, phoneNumber);
-        console.log(`[PhonePairing] ${sessionId} result=${result}`);
-
         if (result === true)    { break; }
         if (result === 'ABORT') { break; }
-        if (result === 'RESET') { shouldResetAuth = true; await sleep(2000); continue; }
+        if (result === 'RESET') { await sleep(2000); continue; }  // auth already wiped in createPhoneSession
         if (result === 'RETRY') { await sleep(3000); continue; }
         break;
     }
@@ -541,7 +461,7 @@ async function restoreUserSessions(userId) {
         try {
             await fs.access(authDir);
             sendToUser(userId, 'log', { level: 'info', msg: `Restoring ${s.session_id}...` });
-            createQRSession(userId, s.session_id, true); // isReconnect=true — preserve saved credentials
+            createQRSession(userId, s.session_id);
             await sleep(STARTUP_STAGGER_MS);
         } catch (_) {
             db.prepare('UPDATE wa_sessions SET state=? WHERE session_id=? AND user_id=?').run('disconnected', s.session_id, userId);
@@ -739,14 +659,247 @@ function requireAdmin(req, res, next) {
 app.use(['/api/user', '/api/admin', '/api/sessions', '/api/job', '/api/db', '/dashboard.html', '/admin.html'], requireAuth);
 app.use('/api/admin', requireAdmin);
 
-// ─── WEBSOCKET ────────────────────────────────────────────────────
-wss.on('connection', (ws, req) => {
-    // Extract session from cookie
-    const cookieHeader = req.headers.cookie || '';
-    const sidMatch     = cookieHeader.match(/connect\.sid=s%3A([^.;]+)/);
-    if (!sidMatch) { ws.close(); return; }
+// ─── AGENT STATE ──────────────────────────────────────────────────
+// One persistent connection from Termux agent
+let agentWS       = null;
+let agentConnected= false;
+const AGENT_SECRET= process.env.AGENT_SECRET || 'agent_secret_change_me';
 
-    // We'll authenticate via first message
+// Sessions stored only in DB now (agent holds live state)
+// waSessions map only tracks what the agent reported
+
+function sendToAgent(type, data = {}) {
+    if (!agentWS || agentWS.readyState !== WebSocket.OPEN) {
+        console.warn(`[Backend] Agent not connected — cannot send ${type}`);
+        return false;
+    }
+    agentWS.send(JSON.stringify({ type, ...data }));
+    return true;
+}
+
+function getReadySessionsForUser(userId) {
+    return [...waSessions.entries()]
+        .filter(([key, s]) => key.startsWith(`${userId}:`) && s.state === 'connected')
+        .map(([, s]) => s);
+}
+
+function broadcastSessionsToUser(userId) {
+    const dbSessions = db.prepare('SELECT * FROM wa_sessions WHERE user_id=? ORDER BY id').all(userId);
+    const list = dbSessions.map(s => {
+        const live = waSessions.get(`${userId}:${s.session_id}`);
+        return {
+            id:     s.session_id,
+            phone:  live?.phone || s.phone || null,
+            method: s.method,
+            state:  live?.state || s.state,
+        };
+    });
+    sendToUser(userId, 'sessions', { sessions: list });
+}
+
+// ─── WEBSOCKET SERVER ─────────────────────────────────────────────
+wss.on('connection', (ws, req) => {
+    const url    = new URL(req.url, 'http://localhost');
+    const secret = url.searchParams.get('secret');
+
+    // ── AGENT CONNECTION ─────────────────────────────────────────
+    if (url.pathname === '/agent') {
+        if (secret !== AGENT_SECRET) {
+            console.warn('[Backend] Agent rejected — wrong secret');
+            ws.close(1008, 'Invalid secret');
+            return;
+        }
+
+        agentWS        = ws;
+        agentConnected = true;
+        console.log('[Backend] ✅ Termux agent connected');
+
+        // Tell all online users agent is available
+        for (const [userId] of wsClients) {
+            sendToUser(userId, 'agent_status', { online: true });
+        }
+
+        ws.on('message', (raw) => {
+            let msg;
+            try { msg = JSON.parse(raw); } catch { return; }
+
+            const { type, userId, sessionId, state, phone } = msg;
+
+            switch (type) {
+
+                case 'agent_hello':
+                    // Agent sent its current session list on reconnect
+                    console.log(`[Backend] Agent hello — ${(msg.sessions||[]).length} active sessions`);
+                    for (const s of (msg.sessions || [])) {
+                        waSessions.set(`${s.userId}:${s.sessionId}`, { state: s.state, phone: s.phone });
+                        db.prepare('UPDATE wa_sessions SET state=?, phone=? WHERE session_id=? AND user_id=?')
+                          .run(s.state, s.phone, s.sessionId, s.userId);
+                        broadcastSessionsToUser(s.userId);
+                    }
+                    break;
+
+                case 'session_state':
+                    // Agent reporting a session state change
+                    waSessions.set(`${userId}:${sessionId}`, { state, phone: phone || null });
+                    db.prepare('UPDATE wa_sessions SET state=?, phone=? WHERE session_id=? AND user_id=?')
+                      .run(state, phone || null, sessionId, userId);
+                    broadcastSessionsToUser(userId);
+                    if (state === 'disconnected') {
+                        sendToUser(userId, 'log', { level: 'warn', msg: `⚠️ ${sessionId} disconnected` });
+                        sendToUser(userId, 'session_disconnected', { sessionId });
+                    }
+                    if (state === 'reconnecting') {
+                        sendToUser(userId, 'log', { level: 'warn', msg: `🔄 ${sessionId} reconnecting...` });
+                    }
+                    break;
+
+                case 'session_connected':
+                    // Agent successfully connected a WA session
+                    waSessions.set(`${userId}:${sessionId}`, { state: 'connected', phone });
+                    db.prepare('UPDATE wa_sessions SET state=?, phone=? WHERE session_id=? AND user_id=?')
+                      .run('connected', phone, sessionId, userId);
+                    broadcastSessionsToUser(userId);
+                    sendToUser(userId, 'session_connected', { sessionId, phone });
+                    sendToUser(userId, 'log', { level: 'success', msg: `✅ ${sessionId} connected — ${phone}` });
+                    break;
+
+                case 'session_removed':
+                    // Agent removed a session (banned/failed)
+                    waSessions.delete(`${userId}:${sessionId}`);
+                    db.prepare('DELETE FROM wa_sessions WHERE session_id=? AND user_id=?').run(sessionId, userId);
+                    broadcastSessionsToUser(userId);
+                    sendToUser(userId, 'log', { level: 'error', msg: `🔴 ${sessionId} removed (${msg.reason || 'unknown'})` });
+                    break;
+
+                case 'qr':
+                    // Forward QR image directly to the user's browser
+                    sendToUser(userId, 'qr', { sessionId, qr: msg.qr });
+                    break;
+
+                case 'pairing_code':
+                    // Forward pairing code directly to the user's browser
+                    sendToUser(userId, 'pairing_code', { sessionId, code: msg.code, phone: msg.phone });
+                    sendToUser(userId, 'log', { level: 'info', msg: `🔑 Pairing code for ${sessionId}: ${msg.code}` });
+                    break;
+
+                case 'pairing_error':
+                    sendToUser(userId, 'log', { level: 'error', msg: `❌ Pairing failed for ${sessionId}: ${msg.error}` });
+                    break;
+
+                case 'job_started':
+                    sendToUser(userId, 'job_start', { jobId: msg.jobId, total: msg.total, mode: 'NEW' });
+                    break;
+
+                case 'job_progress':
+                    sendToUser(userId, 'progress', {
+                        jobId:     msg.jobId,
+                        processed: msg.processed,
+                        total:     msg.total,
+                        pct:       msg.pct,
+                        eta:       msg.eta,
+                        sessions:  msg.sessions,
+                        reg:       msg.reg    || 0,
+                        notReg:    msg.notReg || 0,
+                        hitRate:   msg.hitRate || '0.0',
+                    });
+                    break;
+
+                case 'job_results':
+                    // Agent streaming batch results — save to DB and forward to user
+                    if (msg.results?.length) {
+                        let reg = 0, notReg = 0;
+                        for (const { num, result } of msg.results) {
+                            resultsCache.set(num, result);
+                            if (result !== 'not_registered') reg++;
+                            else notReg++;
+                        }
+                        // Persist every 200 results
+                        if (resultsCache.size % 200 === 0) saveResultsDB().catch(() => {});
+
+                        sendToUser(userId, 'progress', {
+                            jobId:     msg.jobId,
+                            processed: msg.processed,
+                            total:     msg.total,
+                            pct:       ((msg.processed / msg.total) * 100).toFixed(1),
+                            reg:       reg,
+                            notReg:    notReg,
+                            sessions:  getReadySessionsForUser(userId).length,
+                        });
+                    }
+                    break;
+
+                case 'job_complete':
+                    saveResultsDB().catch(() => {});
+                    db.prepare('UPDATE jobs SET status=?,processed=?,completed_at=? WHERE job_id=?')
+                      .run('completed', msg.processed, new Date().toISOString(), msg.jobId);
+
+                    // Build result data from cache for download
+                    const jobRec = db.prepare('SELECT * FROM jobs WHERE job_id=?').get(msg.jobId);
+                    sendToUser(userId, 'job_complete', {
+                        jobId:   msg.jobId,
+                        total:   msg.total,
+                        reg:     msg.registered   || 0,
+                        notReg:  msg.notRegistered || 0,
+                        onDevice:msg.onDevice      || 0,
+                        regData:    msg.regData    || [],
+                        notRegData: msg.notRegData || [],
+                    });
+                    sendToUser(userId, 'log', { level: 'success', msg: `🎉 Job complete — ${msg.processed} checked` });
+                    break;
+
+                case 'job_paused':
+                    db.prepare('UPDATE jobs SET status=? WHERE job_id=?').run('paused', msg.jobId);
+                    sendToUser(userId, 'job_paused', { jobId: msg.jobId });
+                    sendToUser(userId, 'log', { level: 'warn', msg: 'Sessions offline — job paused' });
+                    break;
+
+                case 'job_resumed':
+                    db.prepare('UPDATE jobs SET status=? WHERE job_id=?').run('running', msg.jobId);
+                    sendToUser(userId, 'job_start', { jobId: msg.jobId, total: msg.total, mode: 'RESUME' });
+                    sendToUser(userId, 'log', { level: 'info', msg: `▶️ Job auto-resumed — ${msg.remaining} numbers remaining` });
+                    break;
+
+                case 'job_error':
+                    sendToUser(userId, 'log', { level: 'error', msg: `Job error: ${msg.error}` });
+                    break;
+
+                case 'session_list':
+                    // Agent sent full session list (response to get_sessions)
+                    for (const s of (msg.sessions || [])) {
+                        waSessions.set(`${s.userId}:${s.sessionId}`, { state: s.state, phone: s.phone });
+                    }
+                    break;
+
+                case 'pong':
+                    break; // heartbeat response
+
+                default:
+                    console.warn('[Backend] Unknown agent message:', type);
+            }
+        });
+
+        ws.on('close', () => {
+            agentWS        = null;
+            agentConnected = false;
+            console.log('[Backend] ⚠️ Termux agent disconnected');
+            for (const [userId] of wsClients) {
+                sendToUser(userId, 'agent_status', { online: false });
+                sendToUser(userId, 'log', { level: 'warn', msg: '⚠️ Agent disconnected — sessions may be unavailable' });
+            }
+        });
+
+        ws.on('error', () => ws.close());
+
+        // Heartbeat every 30s
+        const heartbeat = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }));
+            else clearInterval(heartbeat);
+        }, 30000);
+
+        return;
+    }
+
+    // ── BROWSER CLIENT CONNECTION ─────────────────────────────────
     ws.on('message', (raw) => {
         try {
             const msg = JSON.parse(raw);
@@ -756,6 +909,7 @@ wss.on('connection', (ws, req) => {
                 wsClients.get(msg.userId).add(ws);
                 broadcastSessionsToUser(msg.userId);
                 ws.send(JSON.stringify({ type: 'authed' }));
+                ws.send(JSON.stringify({ type: 'agent_status', online: agentConnected }));
             }
         } catch (_) {}
     });
@@ -796,54 +950,53 @@ app.post('/api/auth/login', async (req, res) => {
     db.prepare('UPDATE users SET last_login=? WHERE id=?').run(new Date().toISOString(), user.id);
     req.session.user = { id: user.id, email: user.email, username: user.username, role: user.role };
     res.json({ ok: true, user: req.session.user });
-    // Restore sessions in background
-    restoreUserSessions(user.id);
 });
 
-app.post('/api/auth/logout', (req, res) => {
-    req.session.destroy();
-    res.json({ ok: true });
-});
-
+app.post('/api/auth/logout', (req, res) => { req.session.destroy(); res.json({ ok: true }); });
 app.get('/api/auth/me', (req, res) => {
     if (!req.session.user) return res.status(401).json({ error: 'Not authenticated' });
     res.json(req.session.user);
 });
 
-// ─── USER ROUTES ──────────────────────────────────────────────────
+// ─── USER SESSION ROUTES (proxy to agent) ────────────────────────
 app.get('/api/user/sessions', requireAuth, (req, res) => {
     const userId   = req.session.user.id;
     const sessions = db.prepare('SELECT * FROM wa_sessions WHERE user_id=? ORDER BY id').all(userId);
     const list = sessions.map(s => {
-        const key  = `${userId}:${s.session_id}`;
-        const live = waSessions.get(key);
-        return { id: s.session_id, phone: live?.phone || s.phone || live?.pairingPhone || null, method: s.method, state: live?.state || s.state };
+        const live = waSessions.get(`${userId}:${s.session_id}`);
+        return { id: s.session_id, phone: live?.phone || s.phone || null, method: s.method, state: live?.state || s.state };
     });
     res.json(list);
 });
 
+app.get('/api/agent/status', requireAuth, (req, res) => {
+    res.json({ online: agentConnected });
+});
+
 app.post('/api/user/sessions/add-qr', requireAuth, async (req, res) => {
-    const userId  = req.session.user.id;
+    const userId = req.session.user.id;
+    if (!agentConnected) return res.status(503).json({ error: 'Agent not connected — start agent.js on Termux' });
     const current = db.prepare('SELECT COUNT(*) as cnt FROM wa_sessions WHERE user_id=?').get(userId).cnt;
     if (current >= MAX_SESSIONS_PER_USER) return res.status(429).json({ error: `Max ${MAX_SESSIONS_PER_USER} sessions allowed` });
-    const count     = db.prepare('SELECT COUNT(*) as cnt FROM wa_sessions WHERE user_id=?').get(userId).cnt;
-    const sessionId = `wa${count + 1}_${crypto.randomBytes(2).toString('hex')}`;
+    const allCount  = db.prepare('SELECT COUNT(*) as cnt FROM wa_sessions WHERE user_id=?').get(userId).cnt;
+    const sessionId = `wa${allCount + 1}_${crypto.randomBytes(2).toString('hex')}`;
     db.prepare('INSERT INTO wa_sessions (session_id, user_id, method, state) VALUES (?,?,?,?)').run(sessionId, userId, 'qr', 'initializing');
+    sendToAgent('create_qr_session', { userId, sessionId });
     res.json({ ok: true, sessionId });
-    createQRSession(userId, sessionId);
 });
 
 app.post('/api/user/sessions/add-phone', requireAuth, async (req, res) => {
     const userId = req.session.user.id;
-    const phone  = (req.body.phone || '').replace(/\D/g, '');
+    if (!agentConnected) return res.status(503).json({ error: 'Agent not connected — start agent.js on Termux' });
+    const phone = (req.body.phone || '').replace(/\D/g, '');
     if (phone.length < 8) return res.status(400).json({ error: 'Invalid phone number' });
     const current = db.prepare('SELECT COUNT(*) as cnt FROM wa_sessions WHERE user_id=?').get(userId).cnt;
     if (current >= MAX_SESSIONS_PER_USER) return res.status(429).json({ error: `Max ${MAX_SESSIONS_PER_USER} sessions allowed` });
-    const count     = db.prepare('SELECT COUNT(*) as cnt FROM wa_sessions WHERE user_id=?').get(userId).cnt;
-    const sessionId = `wa${count + 1}_${crypto.randomBytes(2).toString('hex')}`;
+    const allCount  = db.prepare('SELECT COUNT(*) as cnt FROM wa_sessions WHERE user_id=?').get(userId).cnt;
+    const sessionId = `wa${allCount + 1}_${crypto.randomBytes(2).toString('hex')}`;
     db.prepare('INSERT INTO wa_sessions (session_id, user_id, method, state) VALUES (?,?,?,?)').run(sessionId, userId, 'phone', 'initializing');
+    sendToAgent('create_phone_session', { userId, sessionId, phone });
     res.json({ ok: true, sessionId });
-    runPhonePairingWithRetry(userId, sessionId, phone);
 });
 
 app.delete('/api/user/sessions/:id', requireAuth, async (req, res) => {
@@ -851,7 +1004,10 @@ app.delete('/api/user/sessions/:id', requireAuth, async (req, res) => {
     const sessionId = req.params.id;
     const existing  = db.prepare('SELECT id FROM wa_sessions WHERE session_id=? AND user_id=?').get(sessionId, userId);
     if (!existing) return res.status(404).json({ error: 'Session not found' });
-    await deleteWASession(userId, sessionId);
+    sendToAgent('delete_session', { userId, sessionId });
+    waSessions.delete(`${userId}:${sessionId}`);
+    db.prepare('DELETE FROM wa_sessions WHERE session_id=? AND user_id=?').run(sessionId, userId);
+    broadcastSessionsToUser(userId);
     res.json({ ok: true });
 });
 
@@ -880,21 +1036,23 @@ app.post('/api/user/job/start', requireAuth, async (req, res) => {
     const userId  = req.session.user.id;
     const { jobData, mode } = req.body;
     if (!jobData) return res.status(400).json({ error: 'No job data' });
+    if (!agentConnected) return res.status(503).json({ error: 'Agent not connected — start agent.js on Termux' });
 
     const jobId   = makeJobId();
     const numbers = mode === 'all' ? jobData.allNumbers : jobData.unknown;
-    const total   = mode === 'all' ? jobData.allNumbers.length : jobData.allNumbers.length;
-    const meta    = mode === 'all' ? { ...jobData, knownReg: [], knownNotReg: [], freshReg: [], freshNotReg: [], total, mode, fromCache: 0 } : { ...jobData, total, mode, fromCache: jobData.fromCache || 0 };
+    const total   = jobData.allNumbers.length;
 
-    db.prepare('INSERT INTO jobs (job_id, user_id, filename, total, status, mode, from_cache) VALUES (?,?,?,?,?,?,?)').run(jobId, userId, jobData.filename || 'upload', total, 'running', mode, meta.fromCache || 0);
+    db.prepare('INSERT INTO jobs (job_id, user_id, filename, total, status, mode, from_cache) VALUES (?,?,?,?,?,?,?)')
+      .run(jobId, userId, jobData.filename || 'upload', total, 'running', mode, jobData.fromCache || 0);
 
     res.json({ ok: true, jobId });
-    startUserJob(userId, jobId, numbers, meta);
+
+    // Send job to agent — agent does all the WA checking
+    sendToAgent('start_check_job', { jobId, userId, numbers });
 });
 
 app.post('/api/user/job/:jobId/stop', requireAuth, (req, res) => {
-    const job = activeJobs.get(req.params.jobId);
-    if (job && job.userId === req.session.user.id) job.aborted = true;
+    sendToAgent('stop_check_job', { jobId: req.params.jobId, userId: req.session.user.id });
     res.json({ ok: true });
 });
 
@@ -903,26 +1061,28 @@ app.post('/api/user/job/:jobId/resume', requireAuth, async (req, res) => {
     const jobId  = req.params.jobId;
     const dbJob  = db.prepare('SELECT * FROM jobs WHERE job_id=? AND user_id=?').get(jobId, userId);
     if (!dbJob) return res.status(404).json({ error: 'Job not found' });
+    if (!agentConnected) return res.status(503).json({ error: 'Agent not connected' });
+    // Load pending numbers and resend to agent
+    try {
+        const pendingFile = path.join(PENDING_DIR, `${jobId}.json`);
+        const state = JSON.parse(await fs.readFile(pendingFile, 'utf8'));
+        const unknown = (state.unknown || []).filter(n => !resultsCache.has(n));
+        if (!unknown.length) return res.json({ ok: true, message: 'Job already complete' });
+        sendToAgent('start_check_job', { jobId, userId, numbers: unknown });
+        db.prepare('UPDATE jobs SET status=? WHERE job_id=?').run('running', jobId);
+    } catch { return res.status(404).json({ error: 'No pending state found' }); }
     res.json({ ok: true });
-    resumeUserJob(userId, jobId);
 });
 
 app.get('/api/user/jobs', requireAuth, (req, res) => {
     const jobs = db.prepare('SELECT * FROM jobs WHERE user_id=? ORDER BY created_at DESC LIMIT 50').all(req.session.user.id);
-    // Merge with active state
-    const enriched = jobs.map(j => {
-        const live = activeJobs.get(j.job_id);
-        return live ? { ...j, status: 'running', processed: live.processed, registered: live.reg, not_found: live.notReg } : j;
-    });
-    res.json(enriched);
+    res.json(jobs);
 });
 
 app.get('/api/user/job/:jobId/status', requireAuth, (req, res) => {
-    const live = activeJobs.get(req.params.jobId);
-    if (live && live.userId === req.session.user.id) return res.json({ running: true, ...live });
     const job = db.prepare('SELECT * FROM jobs WHERE job_id=? AND user_id=?').get(req.params.jobId, req.session.user.id);
     if (!job) return res.status(404).json({ error: 'Not found' });
-    res.json({ running: false, ...job });
+    res.json(job);
 });
 
 // ─── DB ROUTES (user read, admin write) ───────────────────────────
