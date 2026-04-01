@@ -479,13 +479,29 @@ async function handleFile(file) {
     jobData = d.jobData;
     document.getElementById('dzic').textContent = '✅';
     document.getElementById('dztx').innerHTML   = `<b>${file.name}</b><br><span style="color:var(--g);font-size:12px">${d.total.toLocaleString()} numbers loaded</span>`;
+
     const fi = document.getElementById('finfo');
-    fi.innerHTML = `📦 <b>${d.total.toLocaleString()}</b> total · ⚡ <b style="color:var(--g)">${(d.fromCache||0).toLocaleString()}</b> cached · 🆕 <b style="color:var(--c)">${d.unknown.toLocaleString()}</b> new`;
+
+    // Build cached summary with immediate download if cache exists
+    const cachedReg    = d.jobData.knownReg    || [];
+    const cachedNotReg = d.jobData.knownNotReg || [];
+    const cacheTotal   = cachedReg.length + cachedNotReg.length;
+
+    let cacheHtml = `📦 <b>${d.total.toLocaleString()}</b> total &nbsp;·&nbsp; ⚡ <b style="color:var(--g)">${cacheTotal.toLocaleString()}</b> cached &nbsp;·&nbsp; 🆕 <b style="color:var(--c)">${d.unknown.toLocaleString()}</b> new`;
+
+    if (cacheTotal > 0) {
+      cacheHtml += `<br><span style="color:var(--m);font-size:11px">Cached: ✅ ${cachedReg.length} registered · ❌ ${cachedNotReg.length} not found</span>`;
+      cacheHtml += `<br><span style="font-size:11px">Download cached results now:</span>
+        <button onclick="dlCSV('Number,Device Status\\n'+${JSON.stringify(cachedReg)}.join('\\n'),'cached_registered.csv')" style="background:rgba(37,211,102,.15);border:1px solid rgba(37,211,102,.3);color:var(--g);border-radius:7px;padding:3px 9px;font-size:11px;cursor:pointer;margin:4px 4px 0 0">⬇️ Cached Registered (${cachedReg.length})</button>
+        <button onclick="dlCSV('Number\\n'+${JSON.stringify(cachedNotReg)}.join('\\n'),'cached_not_found.csv')" style="background:rgba(255,77,109,.1);border:1px solid rgba(255,77,109,.25);color:var(--r);border-radius:7px;padding:3px 9px;font-size:11px;cursor:pointer;margin:4px 0 0 0">⬇️ Cached Not Found (${cachedNotReg.length})</button>`;
+    }
+
+    fi.innerHTML = cacheHtml;
     fi.classList.add('on');
     document.getElementById('jbtns').style.display = '';
     document.getElementById('nc').textContent = d.unknown.toLocaleString();
     document.getElementById('ac').textContent = d.total.toLocaleString();
-    addLog(`File: ${file.name} — ${d.total} numbers (${d.unknown} new, ${d.fromCache||0} cached)`, 'info');
+    addLog(`File: ${file.name} — ${d.total} numbers (${d.unknown} new, ${cacheTotal} cached)`, 'info');
     toast(`Loaded ${d.total.toLocaleString()} numbers`, 'ok');
   } catch(e) { toast('Upload failed: '+e.message, 'err'); document.getElementById('dzic').textContent='❌'; }
 }
@@ -552,11 +568,20 @@ function onJobComplete(d) {
   document.getElementById('rt').textContent  = (d.total||0).toLocaleString();
   document.getElementById('rr').textContent  = (d.reg||0).toLocaleString();
   document.getElementById('rnr').textContent = (d.notReg||0).toLocaleString();
+
+  // Final CSVs include BOTH cached + freshly checked numbers
   document.getElementById('dlReg').onclick = () => dlCSV('Number,Device Status\n'+(d.regData||[]).join('\n'),'registered.csv');
   document.getElementById('dlNot').onclick = () => dlCSV('Number\n'+(d.notRegData||[]).join('\n'),'not_registered.csv');
+
   document.getElementById('rp').classList.add('on');
   loadStats();
-  toast(`✅ Done — ${d.reg} registered, ${d.notReg} not found`, 'ok');
+
+  const fromCache    = d.fromCache    || 0;
+  const freshChecked = d.freshChecked || 0;
+  let msg = `✅ Done — ${(d.reg||0).toLocaleString()} registered, ${(d.notReg||0).toLocaleString()} not found`;
+  if (fromCache > 0) msg += ` (incl. ${fromCache} from cache)`;
+  toast(msg, 'ok', 5000);
+  addLog(msg, 'success');
   if (histVisible) loadHistory();
 }
 
