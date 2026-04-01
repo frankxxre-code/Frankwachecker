@@ -377,6 +377,8 @@ function handle(d) {
   if (d.type === 'job_complete')     onJobComplete(d);
   if (d.type === 'job_stopped')      onJobStopped(d);
   if (d.type === 'job_paused')       onJobPaused(d);
+  if (d.type === 'job_waiting')      onJobWaiting(d);
+  if (d.type === 'job_resumed_auto') onJobResumedAuto(d);
 }
 
 /* ── SESSIONS ──────────────────────────────────────────────── */
@@ -477,6 +479,9 @@ async function handleFile(file) {
     const d = await r.json();
     if (!d.ok) { toast(d.error||'Upload failed', 'err'); document.getElementById('dzic').textContent='❌'; document.getElementById('dztx').textContent=d.error||'Failed'; return; }
     jobData = d.jobData;
+    // Store cached arrays separately for download buttons (avoids inline JS size limits)
+    window._cachedRegData    = d.cachedRegData    || [];
+    window._cachedNotRegData = d.cachedNotRegData || [];
     document.getElementById('dzic').textContent = '✅';
     document.getElementById('dztx').innerHTML   = `<b>${file.name}</b><br><span style="color:var(--g);font-size:12px">${d.total.toLocaleString()} numbers loaded</span>`;
 
@@ -492,8 +497,8 @@ async function handleFile(file) {
     if (cacheTotal > 0) {
       cacheHtml += `<br><span style="color:var(--m);font-size:11px">Cached: ✅ ${cachedReg.length} registered · ❌ ${cachedNotReg.length} not found</span>`;
       cacheHtml += `<br><span style="font-size:11px">Download cached results now:</span>
-        <button onclick="dlCSV('Number,Device Status\\n'+${JSON.stringify(cachedReg)}.join('\\n'),'cached_registered.csv')" style="background:rgba(37,211,102,.15);border:1px solid rgba(37,211,102,.3);color:var(--g);border-radius:7px;padding:3px 9px;font-size:11px;cursor:pointer;margin:4px 4px 0 0">⬇️ Cached Registered (${cachedReg.length})</button>
-        <button onclick="dlCSV('Number\\n'+${JSON.stringify(cachedNotReg)}.join('\\n'),'cached_not_found.csv')" style="background:rgba(255,77,109,.1);border:1px solid rgba(255,77,109,.25);color:var(--r);border-radius:7px;padding:3px 9px;font-size:11px;cursor:pointer;margin:4px 0 0 0">⬇️ Cached Not Found (${cachedNotReg.length})</button>`;
+        <button onclick="dlCachedReg()" style="background:rgba(37,211,102,.15);border:1px solid rgba(37,211,102,.3);color:var(--g);border-radius:7px;padding:3px 9px;font-size:11px;cursor:pointer;margin:4px 4px 0 0">⬇️ Cached Registered (${cachedReg.length})</button>
+        <button onclick="dlCachedNotReg()" style="background:rgba(255,77,109,.1);border:1px solid rgba(255,77,109,.25);color:var(--r);border-radius:7px;padding:3px 9px;font-size:11px;cursor:pointer;margin:4px 0 0 0">⬇️ Cached Not Found (${cachedNotReg.length})</button>`;
     }
 
     fi.innerHTML = cacheHtml;
@@ -597,6 +602,16 @@ function onJobPaused(d) {
   document.getElementById('btnRes').style.display  = '';
   toast('Sessions offline — job paused','warn');
 }
+function onJobWaiting(d) {
+  document.getElementById('pph').textContent = '⏳ Waiting for session to reconnect...';
+  toast('WhatsApp disconnected — waiting to reconnect (up to 90s)', 'warn', 6000);
+}
+function onJobResumedAuto(d) {
+  document.getElementById('pph').textContent = '▶️ Session reconnected — resuming...';
+  document.getElementById('btnStop').style.display = '';
+  document.getElementById('btnRes').style.display  = 'none';
+  toast('✅ Session reconnected — job resumed automatically', 'ok');
+}
 
 /* ── LOG ───────────────────────────────────────────────────── */
 function addLog(msg, level='info') {
@@ -665,6 +680,22 @@ async function resumeSpecific(jobId) {
   document.getElementById('btnRes').style.display  = 'none';
   await fetch(`/api/user/job/${jobId}/resume`, { method:'POST' });
   toast('Resuming job...', 'ok');
+}
+
+function dlCachedReg() {
+  const data = window._cachedRegData || [];
+  if (!data.length) { toast('No cached registered data', 'warn'); return; }
+  // Format: each entry is already "num,on_device" or "num,no_device"
+  dlCSV('Number,Device Status\n' + data.map(r => {
+    const [num, status] = r.split(',');
+    return `${num},${status === 'on_device' ? 'On Device' : 'No Device'}`;
+  }).join('\n'), 'cached_registered.csv');
+}
+
+function dlCachedNotReg() {
+  const data = window._cachedNotRegData || [];
+  if (!data.length) { toast('No cached not-found data', 'warn'); return; }
+  dlCSV('Number\n' + data.join('\n'), 'cached_not_found.csv');
 }
 
 /* ── UTILS ─────────────────────────────────────────────────── */
