@@ -559,8 +559,8 @@ async function startUserJob(userId, jobId, numbersToCheck, jobMeta) {
         // Complete
         await saveResultsDB();
         try { await fs.unlink(pendingFile); } catch (_) {}
-        db.prepare('UPDATE jobs SET status=?,processed=?,registered=?,not_found=?,completed_at=datetime("now") WHERE job_id=?')
-          .run('completed', allReg.length + allNotReg.length, allReg.length, allNotReg.length, jobId);
+        db.prepare('UPDATE jobs SET status=?,processed=?,registered=?,not_found=?,completed_at=? WHERE job_id=?')
+          .run('completed', allReg.length + allNotReg.length, allReg.length, allNotReg.length, new Date().toISOString(), jobId);
         activeJobs.delete(jobId);
 
         sendToUser(userId, 'job_complete', { jobId, total: allReg.length + allNotReg.length, reg: allReg.length, notReg: allNotReg.length, onDevice: allReg.filter(r => r.includes('on_device')).length, regData: allReg, notRegData: allNotReg });
@@ -590,7 +590,7 @@ async function resumeUserJob(userId, jobId) {
     const unknown = (state.unknown || []).filter(n => !resultsCache.has(n));
     if (!unknown.length) {
         try { await fs.unlink(pendingFile); } catch (_) {}
-        db.prepare('UPDATE jobs SET status=?,completed_at=datetime("now") WHERE job_id=?').run('completed', jobId);
+        db.prepare('UPDATE jobs SET status=?,completed_at=? WHERE job_id=?').run('completed', new Date().toISOString(), jobId);
         sendToUser(userId, 'job_complete', { jobId, total: (state.knownReg||[]).length + (state.freshReg||[]).length + (state.knownNotReg||[]).length + (state.freshNotReg||[]).length, reg: (state.knownReg||[]).length + (state.freshReg||[]).length, notReg: (state.knownNotReg||[]).length + (state.freshNotReg||[]).length, regData: [...(state.knownReg||[]),...(state.freshReg||[])], notRegData: [...(state.knownNotReg||[]),...(state.freshNotReg||[])] });
         return;
     }
@@ -687,7 +687,7 @@ app.post('/api/auth/login', async (req, res) => {
     const user = db.prepare('SELECT * FROM users WHERE email=?').get((email||'').toLowerCase());
     if (!user || !await bcrypt.compare(password, user.password)) return res.status(401).json({ error: 'Invalid email or password' });
     if (user.banned) return res.status(403).json({ error: 'Account suspended. Contact admin.' });
-    db.prepare('UPDATE users SET last_login=datetime("now") WHERE id=?').run(user.id);
+    db.prepare('UPDATE users SET last_login=? WHERE id=?').run(new Date().toISOString(), user.id);
     req.session.user = { id: user.id, email: user.email, username: user.username, role: user.role };
     res.json({ ok: true, user: req.session.user });
     // Restore sessions in background
