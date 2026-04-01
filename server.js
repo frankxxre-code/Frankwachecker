@@ -384,6 +384,7 @@ async function createPhoneSession(userId, sessionId, phoneNumber) {
                 broadcastSessionsToUser(userId);
 
                 let codeRequested = false;
+                let codeSent      = false;   // true once a real code was displayed
                 let resolved      = false;
                 const done = (val) => { if (resolved) return; resolved = true; resolve(val); };
 
@@ -411,13 +412,24 @@ async function createPhoneSession(userId, sessionId, phoneNumber) {
 
                     if (connection === 'close') {
                         const code = lastDisconnect?.error?.output?.statusCode;
+                        const errMsg = lastDisconnect?.error?.message || '';
+                        console.log(`[PhonePairing] ${sessionId} close — code=${code} codeSent=${codeSent} msg=${errMsg}`);
                         sock.end();
+
+                        // Code expired — always reset auth and get a fresh code
                         if (code === 401) {
                             setTimeout(() => done('RESET'), 2000);
                             return;
                         }
                         if (code === 515 || code === 503) {
                             setTimeout(() => done(sessionCleanup.get(key) ? 'ABORT' : 'RETRY'), 5000);
+                            return;
+                        }
+                        // If we already showed a pairing code and socket closed unexpectedly,
+                        // do a full RESET (wipe auth) — NOT a simple RETRY which reuses bad state.
+                        // Simple RETRY with dirty auth is what was generating the fake codes.
+                        if (codeSent) {
+                            setTimeout(() => done(sessionCleanup.get(key) ? 'ABORT' : 'RESET'), 2000);
                             return;
                         }
                         setTimeout(() => done(sessionCleanup.get(key) ? 'ABORT' : 'RETRY'), 4000);
@@ -430,6 +442,7 @@ async function createPhoneSession(userId, sessionId, phoneNumber) {
                             const code = await sock.requestPairingCode(phoneNumber);
                             if (code && !sessionCleanup.get(key)) {
                                 const fmt = code.match(/.{1,4}/g)?.join('-') || code;
+                                codeSent = true;
                                 s.state = 'awaiting_scan';
                                 db.prepare('UPDATE wa_sessions SET state=? WHERE session_id=? AND user_id=?').run('awaiting_scan', sessionId, userId);
                                 broadcastSessionsToUser(userId);
@@ -439,7 +452,8 @@ async function createPhoneSession(userId, sessionId, phoneNumber) {
                         } catch (err) {
                             console.error('[requestPairingCode]', err.message);
                             sock.end();
-                            done('RETRY');
+                            // Don't retry with dirty auth — reset fully
+                            done('RESET');
                         }
                     }
                 });
@@ -475,6 +489,7 @@ async function runPhonePairingWithRetry(userId, sessionId, phoneNumber) {
 
         sendToUser(userId, 'log', { level: 'info', msg: `Pairing attempt for ${sessionId} (${phoneNumber})` });
         const result = await createPhoneSession(userId, sessionId, phoneNumber);
+        console.log(`[PhonePairing] ${sessionId} result=${result}`);
 
         if (result === true)    { break; }
         if (result === 'ABORT') { break; }
