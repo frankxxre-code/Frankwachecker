@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>WA Checker — Sign In</title>
+<style>
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#070a12;min-height:100vh;display:flex;align-items:center;justify-content:center;overflow:hidden}
+.blob{position:fixed;border-radius:50%;filter:blur(90px);opacity:.1;pointer-events:none;animation:blobMove 10s ease-in-out infinite}
+.b1{width:500px;height:500px;background:#25d366;top:-150px;left:-150px}
+.b2{width:400px;height:400px;background:#0088cc;bottom:-100px;right:-100px;animation-delay:3s}
+.b3{width:300px;height:300px;background:#7c3aed;top:50%;left:50%;animation-delay:6s}
+@keyframes blobMove{0%,100%{transform:scale(1) translate(0,0)}33%{transform:scale(1.08) translate(20px,-20px)}66%{transform:scale(.94) translate(-15px,15px)}}
+.card{position:relative;background:rgba(14,18,32,.9);backdrop-filter:blur(30px);border:1px solid rgba(255,255,255,.06);border-radius:28px;padding:44px 36px;width:100%;max-width:400px;margin:16px;box-shadow:0 40px 100px rgba(0,0,0,.6);animation:up .5s cubic-bezier(.2,.8,.2,1)}
+@keyframes up{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}
+.logo{text-align:center;margin-bottom:36px}
+.logo-ring{width:72px;height:72px;background:linear-gradient(135deg,#25d366,#0088cc);border-radius:22px;display:inline-flex;align-items:center;justify-content:center;font-size:30px;margin-bottom:14px;box-shadow:0 12px 32px rgba(37,211,102,.28)}
+.logo h1{font-size:24px;font-weight:800;color:#fff;letter-spacing:-.5px}
+.logo p{font-size:13px;color:#4b5280;margin-top:5px}
+.tabs{display:grid;grid-template-columns:1fr 1fr;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:14px;padding:4px;margin-bottom:24px}
+.tab{padding:9px;text-align:center;font-size:13px;font-weight:600;color:#4b5280;border-radius:10px;cursor:pointer;transition:.2s}
+.tab.on{background:rgba(37,211,102,.12);color:#25d366;box-shadow:0 2px 8px rgba(37,211,102,.15)}
+.form{display:none}.form.on{display:block;animation:fadein .25s both}
+@keyframes fadein{from{opacity:0}to{opacity:1}}
+.field{position:relative;margin-bottom:13px}
+.fi{position:absolute;left:15px;top:50%;transform:translateY(-50%);font-size:15px;pointer-events:none;z-index:1}
+input{width:100%;padding:13px 14px 13px 44px;background:rgba(255,255,255,.04);border:1.5px solid rgba(255,255,255,.07);color:#e8eaf6;border-radius:13px;font-size:14px;outline:none;transition:.2s}
+input:focus{border-color:#25d366;box-shadow:0 0 0 3px rgba(37,211,102,.1)}
+.eye{position:absolute;right:13px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:15px;color:#4b5280;transition:.15s}
+.eye:hover{color:#25d366}
+.btn{width:100%;padding:15px;background:linear-gradient(135deg,#25d366,#00b4d8);color:#000;border:none;border-radius:13px;font-size:15px;font-weight:700;cursor:pointer;transition:.15s;position:relative;overflow:hidden;margin-top:4px}
+.btn:active{transform:scale(.98)}
+.btn.loading{opacity:.7;pointer-events:none}
+.btn .sp{display:none;width:18px;height:18px;border:2.5px solid rgba(0,0,0,.2);border-top-color:#000;border-radius:50%;animation:spin .7s linear infinite;margin:0 auto}
+.btn.loading .sp{display:block}
+.btn.loading .bt{display:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+.err{color:#ff4d6d;font-size:12px;text-align:center;min-height:18px;margin-top:10px;transition:.2s}
+.or{text-align:center;font-size:12px;color:#4b5280;margin-top:16px}
+.or a{color:#25d366;text-decoration:none;font-weight:600}
+.or a:hover{text-decoration:underline}
+.shake{animation:shake .4s cubic-bezier(.36,.07,.19,.97)}
+@keyframes shake{10%,90%{transform:translateX(-2px)}20%,80%{transform:translateX(4px)}30%,50%,70%{transform:translateX(-5px)}40%,60%{transform:translateX(5px)}}
+</style>
+</head>
+<body>
+<div class="blob b1"></div>
+<div class="blob b2"></div>
+<div class="blob b3"></div>
+<div class="card" id="card">
+  <div class="logo">
+    <div class="logo-ring">📱</div>
+    <h1>WA Checker</h1>
+    <p>WhatsApp Number Verification Platform</p>
+  </div>
+
+  <div class="tabs">
+    <div class="tab on" id="tabLogin"    onclick="switchTab('login')">Sign In</div>
+    <div class="tab"    id="tabRegister" onclick="switchTab('register')">Register</div>
+  </div>
+
+  <!-- Login -->
+  <div class="form on" id="formLogin">
+    <div class="field"><span class="fi">✉️</span><input id="lemail" type="email" placeholder="Email address" autocomplete="email"></div>
+    <div class="field">
+      <span class="fi">🔒</span>
+      <input id="lpw" type="password" placeholder="Password" autocomplete="current-password">
+      <button class="eye" onclick="toggleEye('lpw',this)">👁️</button>
+    </div>
+    <button class="btn" id="btnLogin" onclick="login()"><span class="bt">Sign In</span><div class="sp"></div></button>
+    <div class="err" id="lerr"></div>
+  </div>
+
+  <!-- Register -->
+  <div class="form" id="formRegister">
+    <div class="field"><span class="fi">👤</span><input id="rusername" type="text" placeholder="Username" autocomplete="username"></div>
+    <div class="field"><span class="fi">✉️</span><input id="remail" type="email" placeholder="Email address" autocomplete="email"></div>
+    <div class="field">
+      <span class="fi">🔒</span>
+      <input id="rpw" type="password" placeholder="Password (min 6 chars)" autocomplete="new-password">
+      <button class="eye" onclick="toggleEye('rpw',this)">👁️</button>
+    </div>
+    <button class="btn" id="btnReg" onclick="register()"><span class="bt">Create Account</span><div class="sp"></div></button>
+    <div class="err" id="rerr"></div>
+  </div>
+</div>
+
+<script>
+function switchTab(t) {
+  document.getElementById('tabLogin').classList.toggle('on', t==='login');
+  document.getElementById('tabRegister').classList.toggle('on', t==='register');
+  document.getElementById('formLogin').classList.toggle('on', t==='login');
+  document.getElementById('formRegister').classList.toggle('on', t==='register');
+}
+function toggleEye(id, btn) {
+  const inp = document.getElementById(id);
+  const v   = inp.type === 'password';
+  inp.type  = v ? 'text' : 'password';
+  btn.textContent = v ? '🙈' : '👁️';
+}
+function shake() {
+  const c = document.getElementById('card');
+  c.classList.remove('shake'); void c.offsetWidth; c.classList.add('shake');
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  if (document.getElementById('tabLogin').classList.contains('on')) login();
+  else register();
+});
+
+async function login() {
+  const email = document.getElementById('lemail').value.trim();
+  const pw    = document.getElementById('lpw').value;
+  const btn   = document.getElementById('btnLogin');
+  const err   = document.getElementById('lerr');
+  if (!email || !pw) { err.textContent = 'Please fill in all fields'; shake(); return; }
+  btn.classList.add('loading'); err.textContent = '';
+  try {
+    const r = await fetch('/api/auth/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email,password:pw}) });
+    const d = await r.json();
+    if (d.ok) {
+      btn.style.background = '#25d366';
+      document.querySelector('#btnLogin .bt').textContent = '✅ Welcome!';
+      setTimeout(() => location.href = d.user.role === 'admin' ? '/dashboard.html' : '/dashboard.html', 600);
+    } else { btn.classList.remove('loading'); err.textContent = '❌ ' + d.error; shake(); }
+  } catch { btn.classList.remove('loading'); err.textContent = '❌ Connection error'; }
+}
+
+async function register() {
+  const username = document.getElementById('rusername').value.trim();
+  const email    = document.getElementById('remail').value.trim();
+  const pw       = document.getElementById('rpw').value;
+  const btn      = document.getElementById('btnReg');
+  const err      = document.getElementById('rerr');
+  if (!username || !email || !pw) { err.textContent = 'Please fill in all fields'; shake(); return; }
+  btn.classList.add('loading'); err.textContent = '';
+  try {
+    const r = await fetch('/api/auth/register', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({username,email,password:pw}) });
+    const d = await r.json();
+    if (d.ok) { location.href = '/dashboard.html'; }
+    else { btn.classList.remove('loading'); err.textContent = '❌ ' + d.error; shake(); }
+  } catch { btn.classList.remove('loading'); err.textContent = '❌ Connection error'; }
+}
+</script>
+</body>
+</html>
