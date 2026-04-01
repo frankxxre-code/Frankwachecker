@@ -250,6 +250,13 @@ async function createQRSession(userId, sessionId) {
     const authDir = path.join(AUTH_DIR, String(userId), sessionId);
     if (sessionCleanup.get(key)) return;
 
+    // ✅ FIX: If this is a fresh (not-yet-connected) session, wipe any stale partial auth
+    // so Baileys always generates a fresh QR instead of silently skipping it
+    const isReconnect = waSessions.has(key);
+    if (!isReconnect) {
+        try { await fs.rm(authDir, { recursive: true, force: true }); } catch (_) {}
+    }
+
     await fs.mkdir(authDir, { recursive: true });
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
@@ -365,35 +372,44 @@ async function createPhoneSession(userId, sessionId, phoneNumber) {
         broadcastSessionsToUser(userId);
 
         sock.ev.on('creds.update', saveCreds);
-        let codeRequested = false, resolved = false;
+        let resolved = false;
         const done = v => { if (!resolved) { resolved = true; resolve(v); } };
+
+        // ✅ FIX: Request pairing code OUTSIDE connection.update, scheduled after socket init.
+        // Baileys' requestPairingCode() must be called after the socket is created but
+        // BEFORE it authenticates — calling it inside connection.update at 'connecting'
+        // causes Baileys to generate a random local code instead of fetching from WhatsApp.
+        if (!sock.authState.creds.registered) {
+            sleep(2000).then(async () => {
+                if (sessionCleanup.get(key) || resolved) return;
+                try {
+                    const code = await sock.requestPairingCode(phoneNumber);
+                    if (code && !sessionCleanup.get(key)) {
+                        const fmt = code.match(/.{1,4}/g)?.join('-') || code;
+                        const s = waSessions.get(key);
+                        if (s) {
+                            s.state = 'awaiting_scan';
+                            db.prepare('UPDATE wa_sessions SET state=? WHERE session_id=? AND user_id=?').run('awaiting_scan', sessionId, userId);
+                            broadcastSessionsToUser(userId);
+                        }
+                        sendToUser(userId, 'pairing_code', { sessionId, code: fmt, phone: phoneNumber });
+                        sendToUser(userId, 'log', { level: 'info', msg: `Pairing code for ${sessionId}: ${fmt}` });
+                    }
+                } catch (e) {
+                    sendToUser(userId, 'log', { level: 'error', msg: `Failed to get pairing code: ${e.message}` });
+                    if (!resolved) {
+                        try { sock.end(); } catch(_) {}
+                        done('RETRY');
+                    }
+                }
+            });
+        }
 
         sock.ev.on('connection.update', async (update) => {
             if (sessionCleanup.get(key)) { try { sock.end(); } catch(_){} done('ABORT'); return; }
             const { connection, lastDisconnect } = update;
             const s = waSessions.get(key);
             if (!s) { done('ABORT'); return; }
-
-            // Request pairing code as soon as we are connecting and not yet registered
-            if (!codeRequested && connection === 'connecting' && !sock.authState.creds.registered) {
-                codeRequested = true;
-                await sleep(1500); // wait for connection to stabilize
-                try {
-                    const code = await sock.requestPairingCode(phoneNumber);
-                    if (code && !sessionCleanup.get(key)) {
-                        const fmt = code.match(/.{1,4}/g)?.join('-') || code;
-                        s.state = 'awaiting_scan';
-                        db.prepare('UPDATE wa_sessions SET state=? WHERE session_id=? AND user_id=?').run('awaiting_scan', sessionId, userId);
-                        broadcastSessionsToUser(userId);
-                        sendToUser(userId, 'pairing_code', { sessionId, code: fmt, phone: phoneNumber });
-                        sendToUser(userId, 'log', { level: 'info', msg: `Pairing code for ${sessionId}: ${fmt}` });
-                    }
-                } catch (e) {
-                    sendToUser(userId, 'log', { level: 'error', msg: `Failed to get pairing code: ${e.message}` });
-                    try { sock.end(); } catch(_) {}
-                    done('RETRY');
-                }
-            }
 
             if (connection === 'open') {
                 s.state = 'connected';
