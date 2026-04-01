@@ -719,7 +719,7 @@ wss.on('connection', (ws, req) => {
             sendToUser(userId, 'agent_status', { online: true });
         }
 
-        ws.on('message', (raw) => {
+        ws.on('message', async (raw) => {
             let msg;
             try { msg = JSON.parse(raw); } catch { return; }
 
@@ -833,18 +833,35 @@ wss.on('connection', (ws, req) => {
                     db.prepare('UPDATE jobs SET status=?,processed=?,completed_at=? WHERE job_id=?')
                       .run('completed', msg.processed, new Date().toISOString(), msg.jobId);
 
-                    // Build result data from cache for download
-                    const jobRec = db.prepare('SELECT * FROM jobs WHERE job_id=?').get(msg.jobId);
-                    sendToUser(userId, 'job_complete', {
-                        jobId:   msg.jobId,
-                        total:   msg.total,
-                        reg:     msg.registered   || 0,
-                        notReg:  msg.notRegistered || 0,
-                        onDevice:msg.onDevice      || 0,
-                        regData:    msg.regData    || [],
-                        notRegData: msg.notRegData || [],
-                    });
-                    sendToUser(userId, 'log', { level: 'success', msg: `🎉 Job complete — ${msg.processed} checked` });
+                    // Load cached data saved at job start and merge with fresh results
+                    {
+                        let cachedReg = [], cachedNotReg = [];
+                        try {
+                            const pendingPath = path.join(PENDING_DIR, `${msg.jobId}.json`);
+                            const saved = JSON.parse(await fs.readFile(pendingPath, 'utf8'));
+                            cachedReg    = saved.knownReg    || [];
+                            cachedNotReg = saved.knownNotReg || [];
+                            await fs.unlink(pendingPath).catch(() => {});
+                        } catch(_) {}
+
+                        // Merge: cached + freshly checked
+                        const allReg    = [...cachedReg,    ...(msg.regData    || [])];
+                        const allNotReg = [...cachedNotReg, ...(msg.notRegData || [])];
+                        const totalAll  = allReg.length + allNotReg.length;
+
+                        sendToUser(userId, 'job_complete', {
+                            jobId:      msg.jobId,
+                            total:      totalAll,
+                            reg:        allReg.length,
+                            notReg:     allNotReg.length,
+                            onDevice:   allReg.filter(r => r.includes('on_device')).length,
+                            regData:    allReg,
+                            notRegData: allNotReg,
+                            fromCache:  cachedReg.length + cachedNotReg.length,
+                            freshChecked: msg.processed || 0,
+                        });
+                        sendToUser(userId, 'log', { level: 'success', msg: `🎉 Complete — ${allReg.length} registered, ${allNotReg.length} not found (${cachedReg.length + cachedNotReg.length} from cache)` });
+                    }
                     break;
 
                 case 'job_paused':
@@ -1042,13 +1059,42 @@ app.post('/api/user/job/start', requireAuth, async (req, res) => {
     const numbers = mode === 'all' ? jobData.allNumbers : jobData.unknown;
     const total   = jobData.allNumbers.length;
 
+    // Store cached results so they're merged into final output
+    const cachedReg    = jobData.knownReg    || [];
+    const cachedNotReg = jobData.knownNotReg || [];
+
     db.prepare('INSERT INTO jobs (job_id, user_id, filename, total, status, mode, from_cache) VALUES (?,?,?,?,?,?,?)')
       .run(jobId, userId, jobData.filename || 'upload', total, 'running', mode, jobData.fromCache || 0);
 
+    // Store cached data in DB so job_complete can merge it
+    // Use a simple JSON file in PENDING_DIR
+    const pendingPath = path.join(PENDING_DIR, `${jobId}.json`);
+    await fs.writeFile(pendingPath, JSON.stringify({
+        jobId, userId,
+        unknown:    numbers,
+        knownReg:   cachedReg,
+        knownNotReg:cachedNotReg,
+        allNumbers: jobData.allNumbers,
+        total,
+        mode,
+        filename:   jobData.filename || 'upload',
+        savedAt:    Date.now()
+    }, null, 2), 'utf8');
+
     res.json({ ok: true, jobId });
 
-    // Send job to agent — agent does all the WA checking
-    sendToAgent('start_check_job', { jobId, userId, numbers });
+    // Send numbers to agent in chunks of 500 to avoid WS message size limit
+    const CHUNK_SIZE = 500;
+    if (numbers.length <= CHUNK_SIZE) {
+        sendToAgent('start_check_job', { jobId, userId, numbers });
+    } else {
+        // Send first chunk to start, rest follow as 'add_numbers' messages
+        sendToAgent('start_check_job', { jobId, userId, numbers: numbers.slice(0, CHUNK_SIZE) });
+        for (let i = CHUNK_SIZE; i < numbers.length; i += CHUNK_SIZE) {
+            await new Promise(r => setTimeout(r, 200)); // small gap between chunks
+            sendToAgent('add_job_numbers', { jobId, userId, numbers: numbers.slice(i, i + CHUNK_SIZE) });
+        }
+    }
 });
 
 app.post('/api/user/job/:jobId/stop', requireAuth, (req, res) => {
