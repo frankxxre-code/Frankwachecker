@@ -37,6 +37,25 @@ const PENDING_DIR   = path.join(BASE_DIR, 'pending');
 const AUTH_DIR      = path.join(BASE_DIR, 'sessions');
 const DB_PATH       = path.join(BASE_DIR, 'platform.db');
 
+// ─── PROXY CONFIG ─────────────────────────────────────────────────
+// Error 405 = WhatsApp blocks Railway/datacenter IPs.
+// Fix: set PROXY_URL env var to a residential SOCKS5 proxy.
+// Format: socks5://user:pass@host:port
+const PROXY_URL = process.env.PROXY_URL || null;
+let proxyAgent = null;
+if (PROXY_URL) {
+    try {
+        const { SocksProxyAgent } = require('socks-proxy-agent');
+        proxyAgent = new SocksProxyAgent(PROXY_URL);
+        console.log('🔀 Proxy enabled: ' + PROXY_URL.replace(/:([^:@]+)@/, ':****@'));
+    } catch (e) {
+        console.warn('⚠️  socks-proxy-agent not installed — run: npm install socks-proxy-agent');
+    }
+} else {
+    console.warn('⚠️  PROXY_URL not set. Error 405 = WhatsApp blocking this server IP. Set PROXY_URL in Railway env vars.');
+}
+
+
 // ─── TUNING ──────────────────────────────────────────────────────
 const CONCURRENCY_PER_SESSION = 50;
 const MAX_GLOBAL_CONCURRENT   = 300;
@@ -281,6 +300,7 @@ async function createQRSession(userId, sessionId, isReconnect = false) {
         defaultQueryTimeoutMs: 15000,
         keepAliveIntervalMs:   10000,
         retryRequestDelayMs:   500,
+        ...(proxyAgent ? { agent: proxyAgent } : {}),
     });
 
     si.socket = sock;
@@ -372,6 +392,7 @@ async function createPhoneSession(userId, sessionId, phoneNumber) {
                     keepAliveIntervalMs:   8000,
                     retryRequestDelayMs:   300,
                     defaultQueryTimeoutMs: 12000,
+                    ...(proxyAgent ? { agent: proxyAgent } : {}),
                 });
 
                 // Always fetch fresh si from map (set by runPhonePairingWithRetry before calling us)
