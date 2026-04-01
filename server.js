@@ -607,7 +607,13 @@ const wss    = new WebSocket.Server({ server });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(session({ secret: SESSION_SECRET, resave: false, saveUninitialized: false, cookie: { maxAge: 7 * 24 * 3600 * 1000 } }));
-app.use(express.static(path.join(__dirname, 'public')));
+// Auto-detect whether HTML files are in /public subfolder or root
+const PUBLIC_DIR = (() => {
+    const sub = path.join(__dirname, 'public');
+    try { require('fs').statSync(path.join(sub, 'login.html')); return sub; } catch (_) {}
+    return __dirname;
+})();
+app.use(express.static(PUBLIC_DIR));
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
 
@@ -919,10 +925,10 @@ app.get('/api/admin/jobs', requireAdmin, (req, res) => {
 
 // ─── SERVE PAGES ─────────────────────────────────────────────────
 app.get('/',              (req, res) => res.redirect(req.session?.user ? '/dashboard.html' : '/login.html'));
-app.get('/login.html',    (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
-app.get('/register.html', (req, res) => res.sendFile(path.join(__dirname, 'public', 'register.html')));
-app.get('/dashboard.html',requireAuth, (req, res) => res.sendFile(path.join(__dirname, 'public', 'dashboard.html')));
-app.get('/admin.html',    requireAdmin, (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')));
+app.get('/login.html',    (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'login.html')));
+app.get('/register.html', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'register.html')));
+app.get('/dashboard.html',requireAuth, (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'dashboard.html')));
+app.get('/admin.html',    requireAdmin, (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'admin.html')));
 
 // ─── START ────────────────────────────────────────────────────────
 process.on('unhandledRejection', r => console.warn('[UnhandledRejection]', r));
