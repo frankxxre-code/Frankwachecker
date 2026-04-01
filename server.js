@@ -663,7 +663,7 @@ app.use('/api/admin', requireAdmin);
 // One persistent connection from Termux agent
 let agentWS       = null;
 let agentConnected= false;
-const AGENT_SECRET= process.env.AGENT_SECRET || 'agent_secret_change_me';
+const AGENT_SECRET= process.env.AGENT_SECRET || 'frank_agent_2024';
 
 // Sessions stored only in DB now (agent holds live state)
 // waSessions map only tracks what the agent reported
