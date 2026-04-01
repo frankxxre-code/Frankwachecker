@@ -160,6 +160,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   </div>
   <div class="top-right">
     <div class="ws-pill"><div class="ws-dot" id="wsd"></div><span id="wsl">Connecting</span></div>
+    <div class="ws-pill" id="agentPill" style="display:none"><div class="ws-dot" id="agentDot"></div><span id="agentLabel">Agent</span></div>
     <div style="position:relative">
       <div class="avatar" id="avt" onclick="toggleMenu()">?</div>
       <div class="menu-drop" id="mdrop">
@@ -312,6 +313,19 @@ let jobData = null;
 let activeJobId = null;
 let histVisible = false;
 
+/* ── AGENT STATUS ──────────────────────────────────────────── */
+function onAgentStatus(online) {
+  const pill  = document.getElementById('agentPill');
+  const dot   = document.getElementById('agentDot');
+  const label = document.getElementById('agentLabel');
+  pill.style.display = '';
+  dot.className   = 'ws-dot' + (online ? ' on' : '');
+  label.textContent = online ? 'Agent Online' : 'Agent Offline';
+  if (!online) {
+    toast('⚠️ Termux agent disconnected — run agent.js on your phone', 'warn', 6000);
+  }
+}
+
 /* ── INIT ──────────────────────────────────────────────────── */
 async function init() {
   try {
@@ -351,6 +365,8 @@ function setWS(live) {
 
 function handle(d) {
   if (d.type === 'authed')           return; // authenticated
+  if (d.type === 'agent_status')     return onAgentStatus(d.online);
+  if (d.type === 'session_disconnected') { toast('⚠️ Session ' + d.sessionId + ' disconnected', 'warn'); }
   if (d.type === 'sessions')         return renderSessions(d.sessions);
   if (d.type === 'log')              return addLog(d.msg, d.level);
   if (d.type === 'qr')              { if (d.sessionId) onQR(d.qr); }
@@ -410,6 +426,8 @@ function selM(m) {
   document.getElementById('sph').style.display = m==='phone' ? '' : 'none';
 }
 async function doQR() {
+  const status = await fetch('/api/agent/status').then(r=>r.json()).catch(()=>({online:false}));
+  if (!status.online) { toast('⚠️ Termux agent is offline — run agent.js on your phone first', 'err', 6000); return; }
   document.getElementById('bsqr').style.display   = 'none';
   document.getElementById('qrload').style.display = '';
   await fetch('/api/user/sessions/add-qr', { method:'POST' });
@@ -417,6 +435,8 @@ async function doQR() {
 async function doPhone() {
   const phone = document.getElementById('phin').value.trim().replace(/\D/g,'');
   if (phone.length < 8) { toast('Enter a valid phone number', 'err'); return; }
+  const status = await fetch('/api/agent/status').then(r=>r.json()).catch(()=>({online:false}));
+  if (!status.online) { toast('⚠️ Termux agent is offline — run agent.js on your phone first', 'err', 6000); return; }
   document.getElementById('phform').style.display  = 'none';
   document.getElementById('phload').style.display  = '';
   await fetch('/api/user/sessions/add-phone', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ phone }) });
