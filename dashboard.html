@@ -379,6 +379,7 @@ function handle(d) {
   if (d.type === 'job_paused')       onJobPaused(d);
   if (d.type === 'job_waiting')      onJobWaiting(d);
   if (d.type === 'job_resumed_auto') onJobResumedAuto(d);
+  if (d.type === 'job_restore')      onJobRestore(d);
 }
 
 /* ── SESSIONS ──────────────────────────────────────────────── */
@@ -523,17 +524,39 @@ async function startJob(mode) {
   if (d.ok) activeJobId = d.jobId;
 }
 
-async function stopJob()   { if(activeJobId) await fetch(`/api/user/job/${activeJobId}/stop`,{method:'POST'}); toast('Stop signal sent','warn'); }
+async function stopJob() {
+  if (!activeJobId) {
+    // Try to find running job from history
+    const jobs = await fetch('/api/user/jobs').then(r=>r.json()).catch(()=>[]);
+    const running = jobs.find(j => j.status === 'running' || j.status === 'paused');
+    if (running) activeJobId = running.job_id;
+  }
+  if (!activeJobId) { toast('No active job to stop', 'warn'); return; }
+  await fetch(`/api/user/job/${activeJobId}/stop`, { method:'POST' });
+  toast('Stop signal sent', 'warn');
+}
+
 async function resumeJob() {
-  if (!activeJobId) { toast('No active job to resume','warn'); return; }
+  if (!activeJobId) {
+    // Try to find paused job from history
+    const jobs = await fetch('/api/user/jobs').then(r=>r.json()).catch(()=>[]);
+    const paused = jobs.find(j => j.status === 'paused' || j.status === 'running');
+    if (paused) activeJobId = paused.job_id;
+  }
+  if (!activeJobId) { toast('No active job to resume', 'warn'); return; }
   document.getElementById('btnStop').style.display = '';
   document.getElementById('btnRes').style.display  = 'none';
-  await fetch(`/api/user/job/${activeJobId}/resume`, { method:'POST' });
-  toast('Resuming job...','ok');
+  const r = await fetch(`/api/user/job/${activeJobId}/resume`, { method:'POST' });
+  const d = await r.json().catch(()=>({}));
+  if (d.ok) toast('Resuming job...', 'ok');
+  else toast('Resume failed: ' + (d.error||'unknown'), 'err');
 }
 
 function onJobStart(d) {
   activeJobId = d.jobId;
+  document.getElementById('jbtns').style.display  = 'none';
+  document.getElementById('btnStop').style.display = '';
+  document.getElementById('btnRes').style.display  = 'none';
   document.getElementById('pph').textContent  = `Scanning — ${d.mode||''}`;
   document.getElementById('ppct').textContent = '0%';
   document.getElementById('pf').style.width   = '0%';
@@ -604,13 +627,36 @@ function onJobPaused(d) {
 }
 function onJobWaiting(d) {
   document.getElementById('pph').textContent = '⏳ Waiting for session to reconnect...';
-  toast('WhatsApp disconnected — waiting to reconnect (up to 90s)', 'warn', 6000);
+  toast('WhatsApp disconnected — waiting to reconnect (up to 2 min)', 'warn', 6000);
 }
 function onJobResumedAuto(d) {
+  if (d.jobId) activeJobId = d.jobId;
   document.getElementById('pph').textContent = '▶️ Session reconnected — resuming...';
   document.getElementById('btnStop').style.display = '';
   document.getElementById('btnRes').style.display  = 'none';
   toast('✅ Session reconnected — job resumed automatically', 'ok');
+}
+function onJobRestore(d) {
+  // Dashboard refreshed mid-job — restore the progress bar
+  activeJobId = d.jobId;
+  const pct = d.total > 0 ? ((d.processed / d.total) * 100).toFixed(1) : '0';
+  document.getElementById('pf').style.width   = pct + '%';
+  document.getElementById('ppct').textContent = pct + '%';
+  document.getElementById('pph').textContent  = d.status === 'paused'
+    ? `⏸ Paused — ${d.processed}/${d.total} checked`
+    : `▶️ Checking ${d.processed.toLocaleString()} / ${d.total.toLocaleString()}`;
+  document.getElementById('pp').textContent  = d.processed.toLocaleString();
+  document.getElementById('pr').textContent  = (d.reg||0).toLocaleString();
+  document.getElementById('pnr').textContent = (d.notReg||0).toLocaleString();
+  document.getElementById('pt').textContent  = d.total.toLocaleString();
+  if (d.status === 'paused') {
+    document.getElementById('btnStop').style.display = 'none';
+    document.getElementById('btnRes').style.display  = '';
+  } else {
+    document.getElementById('btnStop').style.display = '';
+    document.getElementById('btnRes').style.display  = 'none';
+  }
+  addLog(`🔄 Restored job ${d.jobId} — ${d.processed}/${d.total} already checked`, 'info');
 }
 
 /* ── LOG ───────────────────────────────────────────────────── */
