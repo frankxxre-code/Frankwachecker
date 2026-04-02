@@ -787,10 +787,17 @@ wss.on('connection', (ws, req) => {
                     break;
 
                 case 'job_started':
+                    // Track in activeJobs for dashboard refresh recovery
+                    activeJobs.set(msg.jobId, { jobId: msg.jobId, userId, processed: 0, total: msg.total, reg: 0, notReg: 0, status: 'running' });
+                    db.prepare('UPDATE jobs SET status=?,total=? WHERE job_id=?').run('running', msg.total, msg.jobId);
                     sendToUser(userId, 'job_start', { jobId: msg.jobId, total: msg.total, mode: 'NEW' });
                     break;
 
-                case 'job_progress':
+                case 'job_progress': {
+                    // Update tracked state
+                    const jt = activeJobs.get(msg.jobId);
+                    if (jt) { jt.processed = msg.processed; jt.total = msg.total; jt.reg = msg.reg||0; jt.notReg = msg.notReg||0; }
+                    db.prepare('UPDATE jobs SET processed=?,registered=?,not_found=? WHERE job_id=?').run(msg.processed, msg.reg||0, msg.notReg||0, msg.jobId);
                     sendToUser(userId, 'progress', {
                         jobId:     msg.jobId,
                         processed: msg.processed,
@@ -803,6 +810,7 @@ wss.on('connection', (ws, req) => {
                         hitRate:   msg.hitRate || '0.0',
                     });
                     break;
+                }
 
                 case 'job_results':
                     // Agent streaming batch results — save to DB and forward to user
@@ -861,7 +869,15 @@ wss.on('connection', (ws, req) => {
                             freshChecked: msg.processed || 0,
                         });
                         sendToUser(userId, 'log', { level: 'success', msg: `🎉 Complete — ${allReg.length} registered, ${allNotReg.length} not found (${cachedReg.length + cachedNotReg.length} from cache)` });
+                        activeJobs.delete(msg.jobId); // clear tracked state
                     }
+                    break;
+
+                case 'job_stopped':
+                    activeJobs.delete(msg.jobId);
+                    db.prepare('UPDATE jobs SET status=? WHERE job_id=?').run('paused', msg.jobId);
+                    sendToUser(userId, 'job_stopped', { jobId: msg.jobId, processed: msg.processed, total: msg.total });
+                    sendToUser(userId, 'log', { level: 'warn', msg: `⛔ Job stopped at ${msg.processed}/${msg.total}` });
                     break;
 
                 case 'job_paused':
@@ -938,6 +954,35 @@ wss.on('connection', (ws, req) => {
                 broadcastSessionsToUser(msg.userId);
                 ws.send(JSON.stringify({ type: 'authed' }));
                 ws.send(JSON.stringify({ type: 'agent_status', online: agentConnected }));
+
+                // Restore active job progress after dashboard refresh
+                const userId = msg.userId;
+                const runningJob = [...activeJobs.values()].find(j => j.userId === userId);
+                if (runningJob) {
+                    ws.send(JSON.stringify({
+                        type: 'job_restore',
+                        jobId: runningJob.jobId,
+                        processed: runningJob.processed || 0,
+                        total: runningJob.total || 0,
+                        reg: runningJob.reg || 0,
+                        notReg: runningJob.notReg || 0,
+                        status: runningJob.status || 'running',
+                    }));
+                } else {
+                    // Check DB for a paused job
+                    const pausedJob = db.prepare("SELECT * FROM jobs WHERE user_id=? AND status IN ('running','paused') ORDER BY created_at DESC LIMIT 1").get(userId);
+                    if (pausedJob) {
+                        ws.send(JSON.stringify({
+                            type: 'job_restore',
+                            jobId: pausedJob.job_id,
+                            processed: pausedJob.processed || 0,
+                            total: pausedJob.total || 0,
+                            reg: pausedJob.registered || 0,
+                            notReg: pausedJob.not_found || 0,
+                            status: pausedJob.status,
+                        }));
+                    }
+                }
             }
         } catch (_) {}
     });
@@ -1122,15 +1167,16 @@ app.post('/api/user/job/:jobId/resume', requireAuth, async (req, res) => {
     const dbJob  = db.prepare('SELECT * FROM jobs WHERE job_id=? AND user_id=?').get(jobId, userId);
     if (!dbJob) return res.status(404).json({ error: 'Job not found' });
     if (!agentConnected) return res.status(503).json({ error: 'Agent not connected' });
-    // Load pending numbers and resend to agent
-    try {
-        const pendingFile = path.join(PENDING_DIR, `${jobId}.json`);
-        const state = JSON.parse(await fs.readFile(pendingFile, 'utf8'));
-        const unknown = (state.unknown || []).filter(n => !resultsCache.has(n));
-        if (!unknown.length) return res.json({ ok: true, message: 'Job already complete' });
-        sendToAgent('start_check_job', { jobId, userId, numbers: unknown });
-        db.prepare('UPDATE jobs SET status=? WHERE job_id=?').run('running', jobId);
-    } catch { return res.status(404).json({ error: 'No pending state found' }); }
+
+    // If already running in activeJobs, just tell dashboard it's running
+    if (activeJobs.has(jobId)) {
+        const j = activeJobs.get(jobId);
+        return res.json({ ok: true, message: 'Already running', processed: j.processed, total: j.total });
+    }
+
+    // Tell agent to resume from its own saved state
+    sendToAgent('resume_check_job', { jobId, userId });
+    db.prepare('UPDATE jobs SET status=? WHERE job_id=?').run('running', jobId);
     res.json({ ok: true });
 });
 
