@@ -482,9 +482,7 @@ async function handleFile(file) {
     const d = await r.json();
     if (!d.ok) { toast(d.error||'Upload failed', 'err'); document.getElementById('dzic').textContent='❌'; document.getElementById('dztx').textContent=d.error||'Failed'; return; }
     jobData = d.jobData;
-    // Ensure uploadToken is preserved (used for fast server-side job start)
-    if (d.jobData.uploadToken) jobData.uploadToken = d.jobData.uploadToken;
-    // Store cached arrays separately for download buttons (avoids inline JS size limits)
+    // Store cached arrays for download buttons
     window._cachedRegData    = d.cachedRegData    || [];
     window._cachedNotRegData = d.cachedNotRegData || [];
     document.getElementById('dzic').textContent = '✅';
@@ -492,7 +490,7 @@ async function handleFile(file) {
 
     const fi = document.getElementById('finfo');
 
-    // Build cached summary with immediate download if cache exists
+    // Build cached summary — knownReg/knownNotReg are full arrays
     const cachedReg    = d.jobData.knownReg    || [];
     const cachedNotReg = d.jobData.knownNotReg || [];
     const cacheTotal   = cachedReg.length + cachedNotReg.length;
@@ -524,24 +522,30 @@ async function startJob(mode) {
   document.getElementById('btnCancel').style.display = '';
   document.getElementById('btnRes').style.display   = 'none';
   document.getElementById('rp').classList.remove('on');
-  // Only send the lightweight token — server loads the actual numbers itself
+  // Send ONLY the token + metadata — server loads numbers itself from the token file
+  // This is the key speed fix: no large arrays travel over the network
   const payload = {
     jobData: {
-      uploadToken:  jobData.uploadToken  || null,
-      filename:     jobData.filename     || '',
-      fromCache:    jobData.fromCache    || 0,
-      // Legacy fallback arrays only if no token (old uploads)
-      allNumbers:   jobData.uploadToken ? undefined : jobData.allNumbers,
-      unknown:      jobData.uploadToken ? undefined : jobData.unknown,
-      knownReg:     jobData.uploadToken ? undefined : jobData.knownReg,
-      knownNotReg:  jobData.uploadToken ? undefined : jobData.knownNotReg,
+      uploadToken: jobData.uploadToken || null,
+      filename:    jobData.filename    || '',
+      fromCache:   jobData.fromCache   || 0,
     },
     mode
   };
-  const r = await fetch('/api/user/job/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+  const r = await fetch('/api/user/job/start', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
   const d = await r.json();
-  if (d.ok) activeJobId = d.jobId;
-  else { toast('Start failed: ' + (d.error||'unknown'), 'err'); document.getElementById('jbtns').style.display = ''; document.getElementById('btnStop').style.display = 'none'; document.getElementById('btnCancel').style.display = 'none'; }
+  if (d.ok) {
+    activeJobId = d.jobId;
+  } else {
+    toast('Start failed: ' + (d.error||'unknown'), 'err');
+    document.getElementById('jbtns').style.display    = '';
+    document.getElementById('btnStop').style.display   = 'none';
+    document.getElementById('btnCancel').style.display = 'none';
+  }
 }
 
 async function cancelJob() {
