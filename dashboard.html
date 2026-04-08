@@ -221,7 +221,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
       </div>
       <div class="brow">
         <button class="btn bw" id="btnRes" onclick="resumeJob()">▶️ Resume</button>
-        <button class="btn br" id="btnStop" onclick="stopJob()" style="display:none">⛔ Stop</button>
+        <button class="btn br" id="btnStop" onclick="stopJob()" style="display:none">⏸ Pause</button>
+        <button class="btn br" id="btnCancel" onclick="cancelJob()" style="display:none;background:#b91c1c">🗑️ Cancel</button>
       </div>
     </div>
   </div>
@@ -376,6 +377,7 @@ function handle(d) {
   if (d.type === 'job_start')        onJobStart(d);
   if (d.type === 'job_complete')     onJobComplete(d);
   if (d.type === 'job_stopped')      onJobStopped(d);
+  if (d.type === 'job_cancelled')    onJobCancelled(d);
   if (d.type === 'job_paused')       onJobPaused(d);
   if (d.type === 'job_waiting')      onJobWaiting(d);
   if (d.type === 'job_resumed_auto') onJobResumedAuto(d);
@@ -516,12 +518,25 @@ async function handleFile(file) {
 async function startJob(mode) {
   if (!jobData) { toast('No file loaded', 'err'); return; }
   document.getElementById('jbtns').style.display   = 'none';
-  document.getElementById('btnStop').style.display = '';
+  document.getElementById('btnStop').style.display   = '';
+  document.getElementById('btnCancel').style.display = '';
   document.getElementById('btnRes').style.display  = 'none';
   document.getElementById('rp').classList.remove('on');
   const r = await fetch('/api/user/job/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({jobData,mode}) });
   const d = await r.json();
   if (d.ok) activeJobId = d.jobId;
+}
+
+async function cancelJob() {
+  if (!activeJobId) {
+    const jobs = await fetch('/api/user/jobs').then(r=>r.json()).catch(()=>[]);
+    const running = jobs.find(j => j.status === 'running' || j.status === 'paused');
+    if (running) activeJobId = running.job_id;
+  }
+  if (!activeJobId) { toast('No active job to cancel', 'warn'); return; }
+  if (!confirm('Cancel this job? All progress will be lost and the file will need to be re-uploaded.')) return;
+  await fetch(`/api/user/job/${activeJobId}/cancel`, { method:'POST' });
+  toast('🗑️ Cancel signal sent — job will be removed', 'warn');
 }
 
 async function stopJob() {
@@ -544,8 +559,9 @@ async function resumeJob() {
     if (paused) activeJobId = paused.job_id;
   }
   if (!activeJobId) { toast('No active job to resume', 'warn'); return; }
-  document.getElementById('btnStop').style.display = '';
-  document.getElementById('btnRes').style.display  = 'none';
+  document.getElementById('btnStop').style.display   = '';
+  document.getElementById('btnCancel').style.display = '';
+  document.getElementById('btnRes').style.display   = 'none';
   const r = await fetch(`/api/user/job/${activeJobId}/resume`, { method:'POST' });
   const d = await r.json().catch(()=>({}));
   if (d.ok) toast('Resuming job...', 'ok');
@@ -554,9 +570,10 @@ async function resumeJob() {
 
 function onJobStart(d) {
   activeJobId = d.jobId;
-  document.getElementById('jbtns').style.display  = 'none';
-  document.getElementById('btnStop').style.display = '';
-  document.getElementById('btnRes').style.display  = 'none';
+  document.getElementById('jbtns').style.display    = 'none';
+  document.getElementById('btnStop').style.display   = '';
+  document.getElementById('btnCancel').style.display = '';
+  document.getElementById('btnRes').style.display   = 'none';
   document.getElementById('pph').textContent  = `Scanning — ${d.mode||''}`;
   document.getElementById('ppct').textContent = '0%';
   document.getElementById('pf').style.width   = '0%';
@@ -589,9 +606,9 @@ function onJobComplete(d) {
   document.getElementById('pf').style.width   = '100%';
   document.getElementById('ppct').textContent = '100%';
   document.getElementById('pph').textContent  = '✅ Complete!';
-  document.getElementById('btnStop').style.display = 'none';
-  document.getElementById('btnRes').style.display  = '';
-  document.getElementById('pr').textContent  = (d.reg||0).toLocaleString();
+  document.getElementById('btnStop').style.display   = 'none';
+  document.getElementById('btnCancel').style.display = 'none';
+  document.getElementById('btnRes').style.display   = '';
   document.getElementById('pnr').textContent = (d.notReg||0).toLocaleString();
   document.getElementById('rt').textContent  = (d.total||0).toLocaleString();
   document.getElementById('rr').textContent  = (d.reg||0).toLocaleString();
@@ -614,11 +631,30 @@ function onJobComplete(d) {
 }
 
 function onJobStopped(d) {
-  document.getElementById('pph').textContent  = `⛔ Stopped at ${d.processed||0}/${d.total||0}`;
-  document.getElementById('btnStop').style.display = 'none';
-  document.getElementById('btnRes').style.display  = '';
-  toast('Job stopped — progress saved','warn');
+  document.getElementById('pph').textContent  = `⏸ Paused at ${d.processed||0}/${d.total||0}`;
+  document.getElementById('btnStop').style.display   = 'none';
+  document.getElementById('btnCancel').style.display = 'none';
+  document.getElementById('btnRes').style.display   = '';
+  toast('Job paused — progress saved','warn');
 }
+function onJobCancelled(d) {
+  activeJobId = null;
+  document.getElementById('pph').textContent  = '🗑️ Job cancelled';
+  document.getElementById('ppct').textContent = '0%';
+  document.getElementById('pf').style.width   = '0%';
+  document.getElementById('btnStop').style.display   = 'none';
+  document.getElementById('btnCancel').style.display = 'none';
+  document.getElementById('btnRes').style.display    = 'none';
+  document.getElementById('jbtns').style.display     = jobData ? '' : 'none';
+  document.getElementById('pp').textContent  = '0';
+  document.getElementById('pr').textContent  = '0';
+  document.getElementById('pnr').textContent = '0';
+  document.getElementById('pe').textContent  = '—';
+  toast('🗑️ Job cancelled and removed', 'warn', 4000);
+  addLog(`🗑️ Job ${d.jobId} cancelled`, 'warn');
+  if (histVisible) loadHistory();
+}
+
 function onJobPaused(d) {
   document.getElementById('pph').textContent  = '⏸ Paused — sessions offline';
   document.getElementById('btnStop').style.display = 'none';
