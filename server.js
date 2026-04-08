@@ -184,14 +184,20 @@ function makeJobId() {
 function extractNumbers(text) {
     text = text.replace(/^\uFEFF/, '').trim();
     const numbers = new Set();
-    const lines   = text.split(/[\r\n]+/).filter(l => l.trim());
+    if (!text.length) return [];
+
+    const lines = text.split(/\r?\n/);
     if (!lines.length) return [];
 
-    const commaLines = lines.slice(0, 15).filter(l => l.includes(',')).length;
-    if (commaLines >= Math.min(3, lines.length)) {
-        const rows   = lines.map(l => l.split(',').map(c => c.trim().replace(/['"]/g, '')));
+    // Detect CSV: check first 10 lines for commas
+    const sample      = lines.slice(0, 10).filter(l => l.trim());
+    const isCSV       = sample.filter(l => l.includes(',')).length >= Math.min(3, sample.length);
+
+    if (isCSV) {
+        // Score columns by how many look like phone numbers
         const scores = {};
-        for (const row of rows.slice(1, 21)) {
+        const sampleRows = sample.map(l => l.split(',').map(c => c.trim().replace(/['"]/g, '')));
+        for (const row of sampleRows.slice(1, 15)) {
             row.forEach((c, ci) => {
                 const d = c.replace(/\D/g,'').replace(/^0+/,'');
                 if (d.length >= 8 && d.length <= 15) scores[ci] = (scores[ci]||0) + 1;
@@ -199,17 +205,41 @@ function extractNumbers(text) {
         }
         const best = Object.keys(scores).sort((a,b) => scores[b]-scores[a])[0];
         if (best !== undefined) {
-            const start = rows[0] && !/\d{8}/.test(rows[0][best]||'') ? 1 : 0;
-            for (let i = start; i < rows.length; i++) {
-                const d = (rows[i][best]||'').replace(/\D/g,'').replace(/^0+/,'');
-                if (d.length >= 8 && d.length <= 15) numbers.add(d);
+            const startRow = sampleRows[0] && !/\d{8}/.test(sampleRows[0][best]||'') ? 1 : 0;
+            for (let i = startRow; i < lines.length; i++) {
+                const line = lines[i];
+                if (!line) continue;
+                // Fast column extract: find nth comma-separated field
+                let col = 0, start = 0;
+                const bi = parseInt(best);
+                for (let j = 0; j <= line.length; j++) {
+                    if (j === line.length || line[j] === ',') {
+                        if (col === bi) {
+                            const d = line.slice(start, j).replace(/['"]/g,'').replace(/\D/g,'').replace(/^0+/,'');
+                            if (d.length >= 8 && d.length <= 15) numbers.add(d);
+                            break;
+                        }
+                        col++; start = j + 1;
+                    }
+                }
             }
             return [...numbers];
         }
     }
-    for (const part of text.split(/[\n\r,;\t\s]+/)) {
-        const d = part.replace(/\D/g,'').replace(/^0+/,'');
-        if (d.length >= 8 && d.length <= 15) numbers.add(d);
+
+    // Plain list: one number per line (fast path)
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        const d = line.replace(/\D/g,'').replace(/^0+/,'');
+        if (d.length >= 8 && d.length <= 15) { numbers.add(d); continue; }
+        // Fallback: split by common delimiters if line contains multiple values
+        if (line.includes(',') || line.includes(';') || line.includes('\t')) {
+            for (const part of line.split(/[,;\t]/)) {
+                const pd = part.trim().replace(/\D/g,'').replace(/^0+/,'');
+                if (pd.length >= 8 && pd.length <= 15) numbers.add(pd);
+            }
+        }
     }
     return [...numbers];
 }
@@ -1105,6 +1135,8 @@ app.delete('/api/user/sessions/:id', requireAuth, async (req, res) => {
 
 app.post('/api/user/upload', requireAuth, upload.single('file'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file' });
+
+    // Parse numbers fast — avoid huge regex splits on giant text
     const content = req.file.buffer.toString('utf8');
     const numbers = extractNumbers(content);
     if (!numbers.length) return res.status(400).json({ error: 'No valid phone numbers found' });
@@ -1113,6 +1145,21 @@ app.post('/api/user/upload', requireAuth, upload.single('file'), async (req, res
     const knownReg    = known.filter(k => k.result !== 'not_registered').map(k => `${k.num},${k.result === 'registered_on_device' ? 'on_device' : 'no_device'}`);
     const knownNotReg = known.filter(k => k.result === 'not_registered').map(k => k.num);
 
+    // Store the full job data server-side with a temp key so the browser
+    // never has to send thousands of numbers back in the job/start body
+    const uploadToken = 'upload_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex');
+    const uploadPath  = path.join(PENDING_DIR, `${uploadToken}.json`);
+    await fs.writeFile(uploadPath, JSON.stringify({
+        allNumbers: numbers,
+        unknown,
+        knownReg,
+        knownNotReg,
+        filename: req.file.originalname,
+        userId: req.session.user.id,
+        savedAt: Date.now(),
+    }), 'utf8'); // compact — no pretty-print
+
+    // Only send lightweight summary to browser — NO large arrays
     res.json({
         ok: true,
         total:      numbers.length,
@@ -1120,10 +1167,17 @@ app.post('/api/user/upload', requireAuth, upload.single('file'), async (req, res
         fromCache:  known.length,
         knownReg:   knownReg.length,
         knownNotReg:knownNotReg.length,
-        jobData: { allNumbers: numbers, unknown, knownReg, knownNotReg, freshReg: [], freshNotReg: [], filename: req.file.originalname },
-        // Also send the actual arrays so dashboard can trigger immediate downloads
-        cachedRegData:    knownReg,
-        cachedNotRegData: knownNotReg,
+        // Lightweight jobData — uploadToken replaces the giant arrays
+        jobData: {
+            uploadToken,
+            filename:    req.file.originalname,
+            fromCache:   known.length,
+            knownReg:    [],   // kept for compat shape
+            knownNotReg: [],
+        },
+        // Send cached arrays only if small enough (< 5000) — else omit
+        cachedRegData:    knownReg.length    <= 5000 ? knownReg    : [],
+        cachedNotRegData: knownNotReg.length <= 5000 ? knownNotReg : [],
     });
 });
 
@@ -1133,43 +1187,56 @@ app.post('/api/user/job/start', requireAuth, async (req, res) => {
     if (!jobData) return res.status(400).json({ error: 'No job data' });
     if (!agentConnected) return res.status(503).json({ error: 'Agent not connected — start agent.js on Termux' });
 
-    const jobId   = makeJobId();
-    const numbers = mode === 'all' ? jobData.allNumbers : jobData.unknown;
-    const total   = jobData.allNumbers.length;
+    // Load full data from server-side upload token (fast — no browser round-trip)
+    let allNumbers, unknown, knownReg, knownNotReg, filename;
+    if (jobData.uploadToken) {
+        const tokenPath = path.join(PENDING_DIR, `${jobData.uploadToken}.json`);
+        try {
+            const saved  = JSON.parse(await fs.readFile(tokenPath, 'utf8'));
+            allNumbers   = saved.allNumbers;
+            unknown      = saved.unknown;
+            knownReg     = saved.knownReg    || [];
+            knownNotReg  = saved.knownNotReg || [];
+            filename     = saved.filename    || 'upload';
+            // Clean up temp token file
+            fs.unlink(tokenPath).catch(() => {});
+        } catch(e) {
+            return res.status(400).json({ error: 'Upload session expired — please re-upload the file' });
+        }
+    } else {
+        // Legacy fallback: browser sent arrays directly (old clients)
+        allNumbers  = jobData.allNumbers  || [];
+        unknown     = jobData.unknown     || [];
+        knownReg    = jobData.knownReg    || [];
+        knownNotReg = jobData.knownNotReg || [];
+        filename    = jobData.filename    || 'upload';
+    }
 
-    // Store cached results so they're merged into final output
-    const cachedReg    = jobData.knownReg    || [];
-    const cachedNotReg = jobData.knownNotReg || [];
+    const numbers = mode === 'all' ? allNumbers : unknown;
+    const total   = allNumbers.length;
+    const jobId   = makeJobId();
 
     db.prepare('INSERT INTO jobs (job_id, user_id, filename, total, status, mode, from_cache) VALUES (?,?,?,?,?,?,?)')
-      .run(jobId, userId, jobData.filename || 'upload', total, 'running', mode, jobData.fromCache || 0);
+      .run(jobId, userId, filename, total, 'running', mode, jobData.fromCache || 0);
 
-    // Store cached data in DB so job_complete can merge it
-    // Use a simple JSON file in PENDING_DIR
+    // Save pending state — compact JSON (no pretty-print = faster write/read)
     const pendingPath = path.join(PENDING_DIR, `${jobId}.json`);
     await fs.writeFile(pendingPath, JSON.stringify({
-        jobId, userId,
-        unknown:    numbers,
-        knownReg:   cachedReg,
-        knownNotReg:cachedNotReg,
-        allNumbers: jobData.allNumbers,
-        total,
-        mode,
-        filename:   jobData.filename || 'upload',
-        savedAt:    Date.now()
-    }, null, 2), 'utf8');
+        jobId, userId, unknown: numbers,
+        knownReg, knownNotReg, allNumbers, total,
+        mode, filename, savedAt: Date.now(),
+    }), 'utf8');
 
     res.json({ ok: true, jobId });
 
-    // Send numbers to agent in chunks of 500 to avoid WS message size limit
-    const CHUNK_SIZE = 500;
+    // Send numbers to agent — bigger chunks, minimal delay
+    const CHUNK_SIZE = 2000;
     if (numbers.length <= CHUNK_SIZE) {
         sendToAgent('start_check_job', { jobId, userId, numbers });
     } else {
-        // Send first chunk to start, rest follow as 'add_numbers' messages
         sendToAgent('start_check_job', { jobId, userId, numbers: numbers.slice(0, CHUNK_SIZE) });
         for (let i = CHUNK_SIZE; i < numbers.length; i += CHUNK_SIZE) {
-            await new Promise(r => setTimeout(r, 200)); // small gap between chunks
+            await new Promise(r => setTimeout(r, 50)); // 50ms gap — was 200ms
             sendToAgent('add_job_numbers', { jobId, userId, numbers: numbers.slice(i, i + CHUNK_SIZE) });
         }
     }
