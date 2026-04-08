@@ -1136,7 +1136,6 @@ app.delete('/api/user/sessions/:id', requireAuth, async (req, res) => {
 app.post('/api/user/upload', requireAuth, upload.single('file'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file' });
 
-    // Parse numbers fast — avoid huge regex splits on giant text
     const content = req.file.buffer.toString('utf8');
     const numbers = extractNumbers(content);
     if (!numbers.length) return res.status(400).json({ error: 'No valid phone numbers found' });
@@ -1145,8 +1144,8 @@ app.post('/api/user/upload', requireAuth, upload.single('file'), async (req, res
     const knownReg    = known.filter(k => k.result !== 'not_registered').map(k => `${k.num},${k.result === 'registered_on_device' ? 'on_device' : 'no_device'}`);
     const knownNotReg = known.filter(k => k.result === 'not_registered').map(k => k.num);
 
-    // Store the full job data server-side with a temp key so the browser
-    // never has to send thousands of numbers back in the job/start body
+    // Store full job data server-side — browser gets a token instead of the giant arrays
+    // This means numbers never travel browser→server again on job start
     const uploadToken = 'upload_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex');
     const uploadPath  = path.join(PENDING_DIR, `${uploadToken}.json`);
     await fs.writeFile(uploadPath, JSON.stringify({
@@ -1157,27 +1156,26 @@ app.post('/api/user/upload', requireAuth, upload.single('file'), async (req, res
         filename: req.file.originalname,
         userId: req.session.user.id,
         savedAt: Date.now(),
-    }), 'utf8'); // compact — no pretty-print
+    }), 'utf8');
 
-    // Only send lightweight summary to browser — NO large arrays
     res.json({
         ok: true,
-        total:      numbers.length,
-        unknown:    unknown.length,
-        fromCache:  known.length,
-        knownReg:   knownReg.length,
-        knownNotReg:knownNotReg.length,
-        // Lightweight jobData — uploadToken replaces the giant arrays
+        total:       numbers.length,
+        unknown:     unknown.length,
+        fromCache:   known.length,
+        knownReg:    knownReg.length,
+        knownNotReg: knownNotReg.length,
         jobData: {
             uploadToken,
             filename:    req.file.originalname,
             fromCache:   known.length,
-            knownReg:    [],   // kept for compat shape
-            knownNotReg: [],
+            // Keep count fields so dashboard cache summary renders correctly
+            knownReg:    knownReg,     // full array — used for download button
+            knownNotReg: knownNotReg,  // full array — used for download button
         },
-        // Send cached arrays only if small enough (< 5000) — else omit
-        cachedRegData:    knownReg.length    <= 5000 ? knownReg    : [],
-        cachedNotRegData: knownNotReg.length <= 5000 ? knownNotReg : [],
+        // Full arrays for the instant download buttons shown after upload
+        cachedRegData:    knownReg,
+        cachedNotRegData: knownNotReg,
     });
 });
 
