@@ -657,8 +657,9 @@ function onJobCancelled(d) {
 
 function onJobPaused(d) {
   document.getElementById('pph').textContent  = '⏸ Paused — sessions offline';
-  document.getElementById('btnStop').style.display = 'none';
-  document.getElementById('btnRes').style.display  = '';
+  document.getElementById('btnStop').style.display   = 'none';
+  document.getElementById('btnCancel').style.display = '';
+  document.getElementById('btnRes').style.display    = '';
   toast('Sessions offline — job paused','warn');
 }
 function onJobWaiting(d) {
@@ -668,8 +669,9 @@ function onJobWaiting(d) {
 function onJobResumedAuto(d) {
   if (d.jobId) activeJobId = d.jobId;
   document.getElementById('pph').textContent = '▶️ Session reconnected — resuming...';
-  document.getElementById('btnStop').style.display = '';
-  document.getElementById('btnRes').style.display  = 'none';
+  document.getElementById('btnStop').style.display   = '';
+  document.getElementById('btnCancel').style.display = '';
+  document.getElementById('btnRes').style.display    = 'none';
   toast('✅ Session reconnected — job resumed automatically', 'ok');
 }
 function onJobRestore(d) {
@@ -686,11 +688,13 @@ function onJobRestore(d) {
   document.getElementById('pnr').textContent = (d.notReg||0).toLocaleString();
   document.getElementById('pt').textContent  = d.total.toLocaleString();
   if (d.status === 'paused') {
-    document.getElementById('btnStop').style.display = 'none';
-    document.getElementById('btnRes').style.display  = '';
+    document.getElementById('btnStop').style.display   = 'none';
+    document.getElementById('btnCancel').style.display = '';
+    document.getElementById('btnRes').style.display    = '';
   } else {
-    document.getElementById('btnStop').style.display = '';
-    document.getElementById('btnRes').style.display  = 'none';
+    document.getElementById('btnStop').style.display   = '';
+    document.getElementById('btnCancel').style.display = '';
+    document.getElementById('btnRes').style.display    = 'none';
   }
   addLog(`🔄 Restored job ${d.jobId} — ${d.processed}/${d.total} already checked`, 'info');
 }
@@ -758,8 +762,9 @@ async function loadHistory() {
 
 async function resumeSpecific(jobId) {
   activeJobId = jobId;
-  document.getElementById('btnStop').style.display = '';
-  document.getElementById('btnRes').style.display  = 'none';
+  document.getElementById('btnStop').style.display   = '';
+  document.getElementById('btnCancel').style.display = '';
+  document.getElementById('btnRes').style.display    = 'none';
   await fetch(`/api/user/job/${jobId}/resume`, { method:'POST' });
   toast('Resuming job...', 'ok');
 }
