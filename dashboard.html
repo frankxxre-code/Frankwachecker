@@ -482,6 +482,8 @@ async function handleFile(file) {
     const d = await r.json();
     if (!d.ok) { toast(d.error||'Upload failed', 'err'); document.getElementById('dzic').textContent='❌'; document.getElementById('dztx').textContent=d.error||'Failed'; return; }
     jobData = d.jobData;
+    // Ensure uploadToken is preserved (used for fast server-side job start)
+    if (d.jobData.uploadToken) jobData.uploadToken = d.jobData.uploadToken;
     // Store cached arrays separately for download buttons (avoids inline JS size limits)
     window._cachedRegData    = d.cachedRegData    || [];
     window._cachedNotRegData = d.cachedNotRegData || [];
@@ -517,14 +519,29 @@ async function handleFile(file) {
 /* ── JOBS ──────────────────────────────────────────────────── */
 async function startJob(mode) {
   if (!jobData) { toast('No file loaded', 'err'); return; }
-  document.getElementById('jbtns').style.display   = 'none';
+  document.getElementById('jbtns').style.display    = 'none';
   document.getElementById('btnStop').style.display   = '';
   document.getElementById('btnCancel').style.display = '';
-  document.getElementById('btnRes').style.display  = 'none';
+  document.getElementById('btnRes').style.display   = 'none';
   document.getElementById('rp').classList.remove('on');
-  const r = await fetch('/api/user/job/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({jobData,mode}) });
+  // Only send the lightweight token — server loads the actual numbers itself
+  const payload = {
+    jobData: {
+      uploadToken:  jobData.uploadToken  || null,
+      filename:     jobData.filename     || '',
+      fromCache:    jobData.fromCache    || 0,
+      // Legacy fallback arrays only if no token (old uploads)
+      allNumbers:   jobData.uploadToken ? undefined : jobData.allNumbers,
+      unknown:      jobData.uploadToken ? undefined : jobData.unknown,
+      knownReg:     jobData.uploadToken ? undefined : jobData.knownReg,
+      knownNotReg:  jobData.uploadToken ? undefined : jobData.knownNotReg,
+    },
+    mode
+  };
+  const r = await fetch('/api/user/job/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
   const d = await r.json();
   if (d.ok) activeJobId = d.jobId;
+  else { toast('Start failed: ' + (d.error||'unknown'), 'err'); document.getElementById('jbtns').style.display = ''; document.getElementById('btnStop').style.display = 'none'; document.getElementById('btnCancel').style.display = 'none'; }
 }
 
 async function cancelJob() {
