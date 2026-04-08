@@ -880,6 +880,25 @@ wss.on('connection', (ws, req) => {
                     sendToUser(userId, 'log', { level: 'warn', msg: `⛔ Job stopped at ${msg.processed}/${msg.total}` });
                     break;
 
+                case 'job_cancelled':
+                    // Agent confirmed cancel — clean up anything left
+                    activeJobs.delete(msg.jobId);
+                    db.prepare("UPDATE jobs SET status='cancelled' WHERE job_id=?").run(msg.jobId);
+                    try { await fs.unlink(path.join(PENDING_DIR, `${msg.jobId}.json`)); } catch(_) {}
+                    sendToUser(userId, 'job_cancelled', { jobId: msg.jobId });
+                    sendToUser(userId, 'log', { level: 'warn', msg: `🗑️ Job ${msg.jobId} cancelled by agent` });
+                    break;
+
+                case 'job_cancelled':
+                    // Agent confirmed it stopped and discarded the job
+                    activeJobs.delete(msg.jobId);
+                    db.prepare('UPDATE jobs SET status=? WHERE job_id=?').run('cancelled', msg.jobId);
+                    // Delete pending file if still there
+                    fs.unlink(path.join(PENDING_DIR, `${msg.jobId}.json`)).catch(() => {});
+                    sendToUser(userId, 'job_cancelled', { jobId: msg.jobId });
+                    sendToUser(userId, 'log', { level: 'warn', msg: `🚫 Job ${msg.jobId} cancelled by agent` });
+                    break;
+
                 case 'job_paused':
                     db.prepare('UPDATE jobs SET status=? WHERE job_id=?').run('paused', msg.jobId);
                     sendToUser(userId, 'job_paused', { jobId: msg.jobId });
@@ -1158,6 +1177,24 @@ app.post('/api/user/job/start', requireAuth, async (req, res) => {
 
 app.post('/api/user/job/:jobId/stop', requireAuth, (req, res) => {
     sendToAgent('stop_check_job', { jobId: req.params.jobId, userId: req.session.user.id });
+    res.json({ ok: true });
+});
+
+app.post('/api/user/job/:jobId/cancel', requireAuth, async (req, res) => {
+    const userId = req.session.user.id;
+    const jobId  = req.params.jobId;
+    const dbJob  = db.prepare('SELECT * FROM jobs WHERE job_id=? AND user_id=?').get(jobId, userId);
+    if (!dbJob) return res.status(404).json({ error: 'Job not found' });
+    // Tell agent to abort AND delete its saved state file
+    sendToAgent('cancel_check_job', { jobId, userId });
+    // Delete pending file on backend side too
+    try { await fs.unlink(path.join(PENDING_DIR, `${jobId}.json`)); } catch(_) {}
+    // Mark cancelled in DB
+    db.prepare("UPDATE jobs SET status='cancelled' WHERE job_id=?").run(jobId);
+    activeJobs.delete(jobId);
+    // Notify the dashboard immediately
+    sendToUser(userId, 'job_cancelled', { jobId });
+    sendToUser(userId, 'log', { level: 'warn', msg: `🗑️ Job ${jobId} cancelled and removed` });
     res.json({ ok: true });
 });
 
